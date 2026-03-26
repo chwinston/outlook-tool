@@ -7,9 +7,10 @@ Cross-platform wrapper around Microsoft Outlook that supports:
   - Downloading attachments from matched emails
   - Sending emails with optional attachments
 
-Platform detection:
+Platform detection (priority order):
   - Windows: win32com (Outlook COM automation) — talks directly to desktop Outlook
-  - Mac/Linux: Microsoft Graph API via MSAL device code auth
+  - Mac: AppleScript/JXA — talks directly to Outlook for Mac (Legacy/Classic mode)
+  - Fallback: Microsoft Graph API via MSAL device code auth
 
 Usage:
     from outlook_tool import OutlookClient
@@ -51,6 +52,7 @@ from typing import Any, Dict, List, Optional, Union
 # =============================================================================
 
 HAS_WIN32 = False
+HAS_APPLESCRIPT = False
 HAS_GRAPH = False
 
 if sys.platform == "win32":
@@ -60,13 +62,307 @@ if sys.platform == "win32":
     except ImportError:
         pass
 
-if not HAS_WIN32:
+if not HAS_WIN32 and sys.platform == "darwin":
+    # Check if osascript exists (always does on macOS)
+    import shutil
+    HAS_APPLESCRIPT = shutil.which("osascript") is not None
+
+if not HAS_WIN32 and not HAS_APPLESCRIPT:
     try:
         import msal
         import requests as _requests
         HAS_GRAPH = True
     except ImportError:
         HAS_GRAPH = False
+
+
+# =============================================================================
+# APPLESCRIPT/JXA BACKEND (Mac — Legacy/Classic Outlook)
+# =============================================================================
+
+import json
+import subprocess
+
+
+def _run_jxa(script: str, timeout: int = 120) -> str:
+    """Run a JXA script via osascript and return stdout."""
+    result = subprocess.run(
+        ["osascript", "-l", "JavaScript", "-e", script],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"JXA error: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def _run_applescript(script: str, timeout: int = 60) -> str:
+    """Run an AppleScript via osascript and return stdout."""
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"AppleScript error: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+class _AppleScriptBackend:
+    """Outlook for Mac email backend using JXA/AppleScript.
+
+    Requires macOS with Microsoft Outlook running in Legacy/Classic mode.
+    No API keys or Azure registration needed — talks directly to the local app.
+    """
+
+    def __init__(self):
+        if sys.platform != "darwin":
+            raise RuntimeError("AppleScript backend only works on macOS")
+
+        try:
+            version = _run_applescript(
+                'tell application "Microsoft Outlook" to get version'
+            )
+            self._version = version
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot connect to Outlook for Mac. "
+                f"Make sure Outlook is running in Legacy/Classic mode.\n{e}"
+            )
+
+    def scan_emails(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        sender_domains: Optional[List[str]] = None,
+        only_with_attachments: Optional[bool] = None,
+        max_results: int = 250,
+    ) -> List[Dict]:
+        """Scan inbox for emails within date range via JXA."""
+        domain_filter_js = "null"
+        if sender_domains:
+            domain_filter_js = json.dumps([d.lower() for d in sender_domains])
+
+        att_filter = "true" if only_with_attachments else "false"
+
+        jxa_script = f"""
+        (function() {{
+            var outlook = Application("Microsoft Outlook");
+            var inbox = outlook.inbox;
+            var msgCount = inbox.messages.length;
+
+            var startMs = {int(start_date.timestamp() * 1000)};
+            var endMs = {int((end_date + timedelta(days=1)).timestamp() * 1000)};
+            var domainFilter = {domain_filter_js};
+            var onlyWithAtt = {att_filter};
+            var maxResults = {max_results};
+
+            var results = [];
+            var scanned = 0;
+
+            for (var i = 0; i < msgCount && i < 5000; i++) {{
+                if (results.length >= maxResults) break;
+                try {{
+                    var msg = inbox.messages[i];
+                    var recvDate = msg.timeReceived();
+                    if (!recvDate) continue;
+
+                    var recvMs = recvDate.getTime();
+
+                    if (recvMs < startMs) break;
+                    if (recvMs >= endMs) continue;
+
+                    scanned++;
+
+                    var attCount = msg.attachments.length;
+                    if (onlyWithAtt && attCount === 0) continue;
+
+                    var senderName = "";
+                    var senderAddr = "";
+                    try {{
+                        var s = msg.sender();
+                        senderName = s.name || "";
+                        senderAddr = s.address || "";
+                    }} catch(e) {{}}
+
+                    if (domainFilter && senderAddr) {{
+                        var domain = senderAddr.split("@").pop().toLowerCase();
+                        if (domainFilter.indexOf(domain) === -1) continue;
+                    }}
+
+                    var atts = [];
+                    for (var j = 0; j < attCount; j++) {{
+                        try {{
+                            var att = msg.attachments[j];
+                            atts.push({{
+                                name: att.name(),
+                                size: att.fileSize(),
+                                index: j + 1
+                            }});
+                        }} catch(e) {{}}
+                    }}
+
+                    if (onlyWithAtt && atts.length === 0) continue;
+
+                    var subject = "";
+                    try {{ subject = msg.subject() || "(No Subject)"; }} catch(e) {{ subject = "(No Subject)"; }}
+
+                    var isRead = false;
+                    try {{ isRead = msg.isRead(); }} catch(e) {{}}
+
+                    var toStr = "";
+                    try {{
+                        var recipients = msg.toRecipients();
+                        var addrs = [];
+                        for (var k = 0; k < recipients.length; k++) {{
+                            try {{ addrs.push(recipients[k].address()); }} catch(e) {{}}
+                        }}
+                        toStr = addrs.join(", ");
+                    }} catch(e) {{}}
+
+                    var bodyPreview = "";
+                    try {{ bodyPreview = (msg.plainTextContent() || "").substring(0, 5000); }} catch(e) {{}}
+
+                    results.push({{
+                        _msg_index: i + 1,
+                        subject: subject,
+                        sender_name: senderName,
+                        sender_email: senderAddr,
+                        received_datetime: recvDate.toISOString(),
+                        is_read: isRead,
+                        has_attachments: atts.length > 0,
+                        to: toStr,
+                        body_preview: bodyPreview,
+                        attachments: atts
+                    }});
+
+                }} catch(e) {{
+                    continue;
+                }}
+            }}
+
+            return JSON.stringify({{
+                scanned: scanned,
+                matched: results.length,
+                results: results
+            }});
+        }})();
+        """
+
+        print(f"Scanning Outlook inbox: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}...")
+
+        raw = _run_jxa(jxa_script, timeout=180)
+        data = json.loads(raw)
+
+        print(f"  Scanned {data['scanned']} messages, found {data['matched']} matches")
+
+        results = []
+        for email in data["results"]:
+            try:
+                received_dt = datetime.fromisoformat(
+                    email["received_datetime"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except (ValueError, AttributeError):
+                received_dt = datetime.now()
+
+            sender_email_addr = email.get("sender_email", "")
+
+            att_list = []
+            for att in email.get("attachments", []):
+                att_list.append({
+                    "id": f"as_{email['_msg_index']}_{att['index']}",
+                    "name": att["name"],
+                    "size": att.get("size", 0),
+                    "_as_msg_index": email["_msg_index"],
+                    "_as_att_index": att["index"],
+                })
+
+            results.append({
+                "id": f"as_msg_{email['_msg_index']}",
+                "subject": email.get("subject", "(No Subject)"),
+                "sender_name": email.get("sender_name", ""),
+                "sender_email": sender_email_addr,
+                "received_datetime": received_dt,
+                "received_date": received_dt.strftime("%Y-%m-%d"),
+                "day_of_week": received_dt.strftime("%A"),
+                "is_read": email.get("is_read", False),
+                "has_attachments": email.get("has_attachments", False),
+                "importance": "normal",  # AppleScript doesn't expose importance easily
+                "body_preview": email.get("body_preview", ""),
+                "to": email.get("to", ""),
+                "attachments": att_list,
+            })
+
+        return results
+
+    def save_attachment(self, msg_index: int, att_index: int, output_path: Path) -> bool:
+        """Save an attachment to disk via AppleScript."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path = str(output_path.resolve())
+
+        script = f'''
+tell application "Microsoft Outlook"
+    set m to message {msg_index} of inbox
+    set att to attachment {att_index} of m
+    save att in POSIX file "{save_path}"
+end tell
+'''
+        _run_applescript(script)
+        return True
+
+    def send_email(
+        self,
+        to: List[str],
+        subject: str,
+        body: str,
+        cc: Optional[List[str]] = None,
+        bcc: Optional[List[str]] = None,
+        attachments: Optional[List[Path]] = None,
+        html: bool = False,
+    ) -> bool:
+        """Send an email via AppleScript."""
+        to_lines = "\n".join(
+            f'        make new to recipient at end of to recipients with properties {{email address:{{address:"{addr}"}}}}'
+            for addr in to
+        )
+        cc_lines = ""
+        if cc:
+            cc_lines = "\n".join(
+                f'        make new cc recipient at end of cc recipients with properties {{email address:{{address:"{addr}"}}}}'
+                for addr in cc
+            )
+        bcc_lines = ""
+        if bcc:
+            bcc_lines = "\n".join(
+                f'        make new bcc recipient at end of bcc recipients with properties {{email address:{{address:"{addr}"}}}}'
+                for addr in bcc
+            )
+
+        # Escape special characters for AppleScript
+        safe_subject = subject.replace("\\", "\\\\").replace('"', '\\"')
+        safe_body = body.replace("\\", "\\\\").replace('"', '\\"')
+
+        content_prop = "content" if html else "plain text content"
+
+        att_lines = ""
+        if attachments:
+            att_lines = "\n".join(
+                f'        make new attachment at end of attachments with properties {{file:POSIX file "{str(p.resolve())}"}}'
+                for p in attachments
+            )
+
+        script = f'''
+tell application "Microsoft Outlook"
+    set newMsg to make new outgoing message with properties {{subject:"{safe_subject}", {content_prop}:"{safe_body}"}}
+    tell newMsg
+{to_lines}
+{cc_lines}
+{bcc_lines}
+{att_lines}
+    end tell
+    send newMsg
+end tell
+'''
+        _run_applescript(script, timeout=30)
+        return True
 
 
 # =============================================================================
@@ -205,8 +501,9 @@ class OutlookClient:
     General-purpose Outlook email client.
 
     Automatically selects the best available backend:
-      - Windows: win32com (Outlook COM)
-      - Mac/Linux: Microsoft Graph API
+      - Windows: win32com (Outlook COM) — talks to desktop Outlook
+      - Mac: AppleScript/JXA — talks to Outlook for Mac (Legacy/Classic mode)
+      - Fallback: Microsoft Graph API (REST, needs auth)
 
     All methods return plain dicts/lists — no COM objects or opaque handles leak out.
     """
@@ -216,6 +513,7 @@ class OutlookClient:
         client_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         token_cache_path: Optional[Path] = None,
+        backend: Optional[str] = None,
     ):
         """
         Initialize the Outlook client.
@@ -224,24 +522,41 @@ class OutlookClient:
             client_id: Azure AD app client ID (Graph API only, optional).
             tenant_id: Azure AD tenant ID (Graph API only, optional).
             token_cache_path: Path for Graph API token cache file.
+            backend: Force a specific backend: "win32com", "applescript", or "graph".
+                     If None, auto-detects based on platform.
         """
-        self.backend = "win32com" if HAS_WIN32 else ("graph" if HAS_GRAPH else None)
+        if backend:
+            self.backend = backend
+        elif HAS_WIN32:
+            self.backend = "win32com"
+        elif HAS_APPLESCRIPT:
+            self.backend = "applescript"
+        elif HAS_GRAPH:
+            self.backend = "graph"
+        else:
+            self.backend = None
 
         if self.backend is None:
             platform_hint = (
                 "Install pywin32: pip install pywin32"
                 if sys.platform == "win32"
+                else "Run Outlook for Mac in Legacy/Classic mode, or install msal + requests"
+                if sys.platform == "darwin"
                 else "Install msal + requests: pip install msal requests"
             )
             raise RuntimeError(f"No email backend available. {platform_hint}")
 
         self._graph: Optional[_GraphBackend] = None
+        self._applescript: Optional[_AppleScriptBackend] = None
+
         if self.backend == "graph":
             self._graph = _GraphBackend(
                 client_id=client_id,
                 tenant_id=tenant_id,
                 token_cache_path=token_cache_path,
             )
+        elif self.backend == "applescript":
+            self._applescript = _AppleScriptBackend()
 
         # For win32com, we store COM references keyed by email ID for attachment download
         self._win32_msg_cache: Dict[str, Any] = {}
@@ -326,6 +641,14 @@ class OutlookClient:
                 importance=importance,
                 max_results=max_results,
             )
+        elif self.backend == "applescript":
+            results = self._search_applescript(
+                date_from=date_from,
+                date_to=date_to,
+                has_attachments=has_attachments,
+                sender_domains=all_domains if all_domains else None,
+                max_results=max_results,
+            )
         else:
             results = self._search_graph(
                 date_from=date_from,
@@ -392,6 +715,8 @@ class OutlookClient:
 
         if self.backend == "win32com":
             self._download_win32(email, attachment, dest)
+        elif self.backend == "applescript":
+            self._download_applescript(email, attachment, dest)
         else:
             self._download_graph(email, attachment, dest)
 
@@ -446,8 +771,48 @@ class OutlookClient:
 
         if self.backend == "win32com":
             return self._send_win32(to, subject, body, cc, bcc, att_paths, html, importance)
+        elif self.backend == "applescript":
+            return self._send_applescript(to, subject, body, cc, bcc, att_paths, html)
         else:
             return self._send_graph(to, subject, body, cc, bcc, att_paths, html, importance)
+
+    # =========================================================================
+    # APPLESCRIPT IMPLEMENTATION
+    # =========================================================================
+
+    def _search_applescript(
+        self, date_from, date_to, has_attachments, sender_domains, max_results,
+    ) -> List[Dict]:
+        """Search emails via AppleScript/JXA (Outlook for Mac Legacy)."""
+        start = date_from or datetime(2000, 1, 1)
+        end = date_to or datetime.now()
+        domain_list = list(sender_domains) if sender_domains else None
+
+        return self._applescript.scan_emails(
+            start_date=start,
+            end_date=end,
+            sender_domains=domain_list,
+            only_with_attachments=has_attachments,
+            max_results=max_results,
+        )
+
+    def _download_applescript(self, email: Dict, attachment: Dict, dest: Path):
+        """Download attachment via AppleScript."""
+        msg_idx = attachment.get("_as_msg_index")
+        att_idx = attachment.get("_as_att_index")
+        if msg_idx is None or att_idx is None:
+            raise RuntimeError(
+                f"Attachment missing AppleScript indices: {attachment}. "
+                "Make sure this attachment came from a search() result."
+            )
+        self._applescript.save_attachment(msg_idx, att_idx, dest)
+
+    def _send_applescript(self, to, subject, body, cc, bcc, attachments, html) -> bool:
+        """Send email via AppleScript."""
+        return self._applescript.send_email(
+            to=to, subject=subject, body=body,
+            cc=cc, bcc=bcc, attachments=attachments, html=html,
+        )
 
     # =========================================================================
     # WIN32COM IMPLEMENTATION

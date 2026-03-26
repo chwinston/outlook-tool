@@ -195,6 +195,7 @@ class TestPostFilters:
 
 class TestClientInit:
     @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool.HAS_APPLESCRIPT", False)
     @patch("outlook_tool.HAS_GRAPH", False)
     def test_no_backend_raises(self):
         with pytest.raises(RuntimeError, match="No email backend available"):
@@ -206,14 +207,46 @@ class TestClientInit:
         assert client.backend == "win32com"
 
     @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool.HAS_APPLESCRIPT", True)
+    @patch("outlook_tool._AppleScriptBackend")
+    def test_applescript_backend_selected(self, mock_as_cls):
+        mock_as_cls.return_value = MagicMock()
+        client = OutlookClient()
+        assert client.backend == "applescript"
+
+    @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool.HAS_APPLESCRIPT", True)
     @patch("outlook_tool.HAS_GRAPH", True)
-    @patch("outlook_tool.msal")
+    @patch("outlook_tool._AppleScriptBackend")
+    def test_applescript_preferred_over_graph(self, mock_as_cls):
+        """AppleScript should win over Graph API on Mac."""
+        mock_as_cls.return_value = MagicMock()
+        client = OutlookClient()
+        assert client.backend == "applescript"
+
+    @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool.HAS_APPLESCRIPT", False)
+    @patch("outlook_tool.HAS_GRAPH", True)
+    @patch("outlook_tool.msal", create=True)
     def test_graph_backend_selected(self, mock_msal):
         mock_msal.SerializableTokenCache.return_value = MagicMock(
             has_state_changed=False
         )
         mock_msal.PublicClientApplication.return_value = MagicMock()
         client = OutlookClient()
+        assert client.backend == "graph"
+
+    @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool.HAS_APPLESCRIPT", True)
+    @patch("outlook_tool.HAS_GRAPH", True)
+    @patch("outlook_tool.msal", create=True)
+    def test_force_graph_backend(self, mock_msal):
+        """backend= kwarg should override auto-detection."""
+        mock_msal.SerializableTokenCache.return_value = MagicMock(
+            has_state_changed=False
+        )
+        mock_msal.PublicClientApplication.return_value = MagicMock()
+        client = OutlookClient(backend="graph")
         assert client.backend == "graph"
 
 
