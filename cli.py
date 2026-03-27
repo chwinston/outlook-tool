@@ -12,7 +12,7 @@ Usage:
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from outlook_tool import OutlookClient
@@ -97,6 +97,61 @@ def cmd_search(args):
     return results
 
 
+def cmd_events(args):
+    """List calendar events."""
+    client = OutlookClient()
+
+    kwargs = {}
+    if args.date_from:
+        kwargs["date_from"] = args.date_from
+    if args.date_to:
+        kwargs["date_to"] = args.date_to
+    elif args.today:
+        kwargs["date_from"] = datetime.now().strftime("%Y-%m-%d")
+        kwargs["date_to"] = datetime.now().strftime("%Y-%m-%d")
+    elif args.week:
+        kwargs["date_from"] = datetime.now().strftime("%Y-%m-%d")
+        kwargs["date_to"] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    if args.subject:
+        kwargs["subject_contains"] = args.subject
+    if args.max_results:
+        kwargs["max_results"] = args.max_results
+
+    results = client.get_events(**kwargs)
+
+    print(f"\nFound {len(results)} event(s)\n")
+
+    for i, evt in enumerate(results, 1):
+        time_str = f"{evt['start_datetime'].strftime('%H:%M')}–{evt['end_datetime'].strftime('%H:%M')}"
+        if evt["is_all_day"]:
+            time_str = "All day"
+        loc = f" @ {evt['location']}" if evt["location"] else ""
+        org = f" (organized by {evt['organizer_name']})" if evt["organizer_name"] else ""
+
+        print(f"  {i}. {evt['start_date']} {time_str}{loc}")
+        print(f"     {evt['subject']}{org}")
+
+        if evt["attendees"]:
+            att_summary = ", ".join(
+                f"{a['name'] or a['email']} ({a['status']})"
+                for a in evt["attendees"][:5]
+            )
+            extra = f" +{len(evt['attendees']) - 5} more" if len(evt["attendees"]) > 5 else ""
+            print(f"     Attendees: {att_summary}{extra}")
+        print()
+
+    if args.json:
+        serializable = []
+        for e in results:
+            entry = {k: v for k, v in e.items() if not k.startswith("_")}
+            entry["start_datetime"] = entry["start_datetime"].isoformat()
+            entry["end_datetime"] = entry["end_datetime"].isoformat()
+            serializable.append(entry)
+        print(json.dumps(serializable, indent=2))
+
+    return results
+
+
 def cmd_send(args):
     """Send an email."""
     client = OutlookClient()
@@ -150,6 +205,17 @@ def main():
     sp.add_argument("--download", metavar="DIR", help="Download attachments to this directory")
     sp.add_argument("--json", action="store_true", help="Output results as JSON")
     sp.set_defaults(func=cmd_search)
+
+    # ---- events ----
+    sp = subparsers.add_parser("events", help="List calendar events")
+    sp.add_argument("--from", dest="date_from", help="Start date (YYYY-MM-DD, default: today)")
+    sp.add_argument("--to-date", dest="date_to", help="End date (YYYY-MM-DD, default: +7 days)")
+    sp.add_argument("--today", action="store_true", help="Show today's events only")
+    sp.add_argument("--week", action="store_true", help="Show this week's events")
+    sp.add_argument("--subject", help="Subject contains (case-insensitive)")
+    sp.add_argument("--max-results", type=int, default=50, help="Max results (default 50)")
+    sp.add_argument("--json", action="store_true", help="Output results as JSON")
+    sp.set_defaults(func=cmd_events)
 
     # ---- send ----
     sp = subparsers.add_parser("send", help="Send an email")

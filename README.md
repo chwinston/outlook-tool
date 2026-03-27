@@ -193,6 +193,25 @@ outlook-tool search --sender-email boss@example.com --has-attachments --download
 
 This creates a `my-downloads` folder and saves all attachments from matching emails into it.
 
+### Calendar Events
+
+```bash
+# Show today's events
+outlook-tool events --today
+
+# Show this week's events
+outlook-tool events --week
+
+# Events in a specific date range
+outlook-tool events --from 2026-03-24 --to-date 2026-03-28
+
+# Filter events by subject
+outlook-tool events --from 2026-03-01 --subject "standup"
+
+# Get events as JSON
+outlook-tool events --from 2026-03-27 --json
+```
+
 ### Send Emails
 
 ```bash
@@ -241,6 +260,14 @@ for email in emails:
     for att in email["attachments"]:
         path = client.download_attachment(email, att, output_dir="./downloads")
         print(f"Saved: {path}")
+
+# Get calendar events
+events = client.get_events(
+    date_from="2026-03-27",
+    date_to="2026-03-28",
+)
+for evt in events:
+    print(f"{evt['start_date']} {evt['start_datetime'].strftime('%H:%M')} — {evt['subject']}")
 
 # Search across multiple folders
 emails = client.search(

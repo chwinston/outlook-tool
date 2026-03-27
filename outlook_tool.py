@@ -432,6 +432,149 @@ end tell
         _run_applescript(script, timeout=30)
         return True
 
+    def get_calendar_events(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        max_results: int = 50,
+    ) -> List[Dict]:
+        """Fetch calendar events within a date range via JXA."""
+        jxa_script = f"""
+        (function() {{
+            var outlook = Application("Microsoft Outlook");
+            var startMs = {int(start_date.timestamp() * 1000)};
+            var endMs = {int((end_date + timedelta(days=1)).timestamp() * 1000)};
+            var maxResults = {max_results};
+            var results = [];
+
+            var accts = outlook.exchangeAccounts();
+            if (accts.length === 0) {{
+                return JSON.stringify({{error: "No Exchange account found"}});
+            }}
+            var acct = accts[0];
+            var calendar = acct.defaultCalendar();
+            var events = calendar.calendarEvents();
+            var evtCount = events.length;
+
+            for (var i = 0; i < evtCount && i < 10000; i++) {{
+                if (results.length >= maxResults) break;
+                try {{
+                    var evt = events[i];
+                    var startTime = evt.startTime();
+                    var endTime = evt.endTime();
+                    if (!startTime) continue;
+
+                    var startMs2 = startTime.getTime();
+                    var endMs2 = endTime ? endTime.getTime() : startMs2;
+
+                    // Event overlaps range if it starts before range end AND ends after range start
+                    if (startMs2 >= endMs) continue;
+                    if (endMs2 < startMs) continue;
+
+                    var subject = "";
+                    try {{ subject = evt.subject() || "(No Subject)"; }} catch(e) {{ subject = "(No Subject)"; }}
+
+                    var location = "";
+                    try {{ location = evt.location() || ""; }} catch(e) {{}}
+
+                    var organizer = "";
+                    try {{ organizer = evt.organizer() || ""; }} catch(e) {{}}
+
+                    var isAllDay = false;
+                    try {{ isAllDay = evt.allDayFlag(); }} catch(e) {{}}
+
+                    var status = "busy";
+                    try {{
+                        var fbs = evt.freeBusyStatus();
+                        if (fbs === "free") status = "free";
+                        else if (fbs === "tentative") status = "tentative";
+                        else if (fbs === "out of office" || fbs === "working elsewhere") status = fbs;
+                        else status = "busy";
+                    }} catch(e) {{}}
+
+                    var bodyPreview = "";
+                    try {{ bodyPreview = (evt.plainTextContent() || "").substring(0, 2000); }} catch(e) {{}}
+
+                    var attendees = [];
+                    try {{
+                        var attList = evt.attendees();
+                        for (var j = 0; j < attList.length; j++) {{
+                            try {{
+                                var att = attList[j];
+                                attendees.push({{
+                                    name: att.name() || "",
+                                    email: att.emailAddress ? (att.emailAddress().address || "") : "",
+                                    status: att.acceptedStatus ? att.acceptedStatus() : "unknown"
+                                }});
+                            }} catch(e2) {{}}
+                        }}
+                    }} catch(e) {{}}
+
+                    results.push({{
+                        subject: subject,
+                        start_datetime: startTime.toISOString(),
+                        end_datetime: endTime ? endTime.toISOString() : startTime.toISOString(),
+                        location: location,
+                        organizer: organizer,
+                        is_all_day: isAllDay,
+                        status: status,
+                        body_preview: bodyPreview,
+                        attendees: attendees
+                    }});
+                }} catch(e) {{ continue; }}
+            }}
+
+            return JSON.stringify({{
+                matched: results.length,
+                results: results
+            }});
+        }})();
+        """
+
+        print(f"Scanning Outlook calendar: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}...")
+
+        raw = _run_jxa(jxa_script, timeout=180)
+        data = json.loads(raw)
+
+        if "error" in data:
+            raise ValueError(data["error"])
+
+        print(f"  Found {data['matched']} event(s)")
+
+        results = []
+        for evt in data["results"]:
+            try:
+                start_dt = datetime.fromisoformat(
+                    evt["start_datetime"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except (ValueError, AttributeError):
+                start_dt = datetime.now()
+
+            try:
+                end_dt = datetime.fromisoformat(
+                    evt["end_datetime"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except (ValueError, AttributeError):
+                end_dt = start_dt
+
+            results.append({
+                "id": f"as_evt_{hash(evt['subject'] + evt['start_datetime'])}",
+                "subject": evt.get("subject", "(No Subject)"),
+                "start_datetime": start_dt,
+                "end_datetime": end_dt,
+                "start_date": start_dt.strftime("%Y-%m-%d"),
+                "end_date": end_dt.strftime("%Y-%m-%d"),
+                "location": evt.get("location", ""),
+                "organizer_name": evt.get("organizer", ""),
+                "organizer_email": "",
+                "is_all_day": evt.get("is_all_day", False),
+                "status": evt.get("status", "busy"),
+                "body_preview": evt.get("body_preview", ""),
+                "attendees": evt.get("attendees", []),
+            })
+
+        return results
+
 
 # =============================================================================
 # GRAPH API BACKEND
@@ -882,6 +1025,63 @@ class OutlookClient:
         else:
             return self._send_graph(to, subject, body, cc, bcc, att_paths, html, importance)
 
+    # -------------------------------------------------------------------------
+    # CALENDAR EVENTS
+    # -------------------------------------------------------------------------
+
+    def get_events(
+        self,
+        date_from: Optional[Union[str, datetime]] = None,
+        date_to: Optional[Union[str, datetime]] = None,
+        subject_contains: Optional[str] = None,
+        max_results: int = 50,
+    ) -> List[Dict]:
+        """
+        Get calendar events within a date range.
+
+        Args:
+            date_from: Start date (inclusive). String "YYYY-MM-DD" or datetime.
+                Defaults to today.
+            date_to: End date (inclusive). String "YYYY-MM-DD" or datetime.
+                Defaults to 7 days from date_from.
+            subject_contains: Case-insensitive substring match on event subject.
+            max_results: Maximum number of results to return (default 50).
+
+        Returns:
+            List of event dicts, each containing:
+                - id: Unique event identifier
+                - subject: Event title
+                - start_datetime: datetime object
+                - end_datetime: datetime object
+                - start_date: "YYYY-MM-DD" string
+                - end_date: "YYYY-MM-DD" string
+                - location: Event location
+                - organizer_name: Organizer display name
+                - organizer_email: Organizer email address
+                - is_all_day: bool
+                - status: "busy", "free", "tentative", "out of office"
+                - body_preview: First 2000 chars of event body
+                - attendees: List of dicts (name, email, status)
+        """
+        start = _parse_date(date_from) if date_from else datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        end = _parse_date(date_to) if date_to else (start + timedelta(days=7))
+
+        if self.backend == "win32com":
+            results = self._get_events_win32(start, end, max_results)
+        elif self.backend == "applescript":
+            results = self._get_events_applescript(start, end, max_results)
+        else:
+            results = self._get_events_graph(start, end, max_results)
+
+        # Post-filter subject in Python (like search() does)
+        if subject_contains:
+            term = subject_contains.lower()
+            results = [e for e in results if term in e.get("subject", "").lower()]
+
+        return results[:max_results]
+
     # =========================================================================
     # APPLESCRIPT IMPLEMENTATION
     # =========================================================================
@@ -939,6 +1139,14 @@ class OutlookClient:
         return self._applescript.send_email(
             to=to, subject=subject, body=body,
             cc=cc, bcc=bcc, attachments=attachments, html=html,
+        )
+
+    def _get_events_applescript(self, date_from, date_to, max_results) -> List[Dict]:
+        """Get calendar events via AppleScript/JXA."""
+        return self._applescript.get_calendar_events(
+            start_date=date_from,
+            end_date=date_to,
+            max_results=max_results,
         )
 
     # =========================================================================
@@ -1142,6 +1350,81 @@ class OutlookClient:
         mail.Send()
         return True
 
+    def _get_events_win32(self, date_from, date_to, max_results) -> List[Dict]:
+        """Get calendar events via win32com."""
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        calendar_folder = namespace.GetDefaultFolder(9)  # olFolderCalendar
+
+        end_inclusive = date_to + timedelta(days=1)
+        restriction = (
+            f"[Start] >= '{date_from.strftime('%m/%d/%Y')}' AND "
+            f"[Start] < '{end_inclusive.strftime('%m/%d/%Y')}'"
+        )
+
+        items = calendar_folder.Items
+        items.Sort("[Start]")
+        items.IncludeRecurrences = True
+        items = items.Restrict(restriction)
+
+        results = []
+        for i, item in enumerate(items):
+            if len(results) >= max_results:
+                break
+            try:
+                start_dt = datetime(
+                    item.Start.year, item.Start.month, item.Start.day,
+                    item.Start.hour, item.Start.minute, item.Start.second,
+                )
+                end_dt = datetime(
+                    item.End.year, item.End.month, item.End.day,
+                    item.End.hour, item.End.minute, item.End.second,
+                )
+
+                organizer = ""
+                try:
+                    organizer = item.Organizer or ""
+                except Exception:
+                    pass
+
+                attendees = []
+                try:
+                    for r in range(1, item.Recipients.Count + 1):
+                        recip = item.Recipients.Item(r)
+                        status_map = {0: "none", 1: "organizer", 2: "tentative",
+                                      3: "accepted", 4: "declined"}
+                        attendees.append({
+                            "name": recip.Name or "",
+                            "email": recip.Address or "",
+                            "status": status_map.get(recip.MeetingResponseStatus, "unknown"),
+                        })
+                except Exception:
+                    pass
+
+                status_map = {0: "free", 1: "tentative", 2: "busy", 3: "out of office"}
+
+                results.append({
+                    "id": f"win32_evt_{item.EntryID[:16] if item.EntryID else i}",
+                    "subject": item.Subject or "(No Subject)",
+                    "start_datetime": start_dt,
+                    "end_datetime": end_dt,
+                    "start_date": start_dt.strftime("%Y-%m-%d"),
+                    "end_date": end_dt.strftime("%Y-%m-%d"),
+                    "location": item.Location or "",
+                    "organizer_name": organizer,
+                    "organizer_email": "",
+                    "is_all_day": bool(item.AllDayEvent),
+                    "status": status_map.get(item.BusyStatus, "busy"),
+                    "body_preview": (item.Body or "")[:2000],
+                    "attendees": attendees,
+                })
+            except Exception:
+                continue
+
+        print(f"Scanning Outlook calendar: {date_from.strftime('%Y-%m-%d')} to {date_to.strftime('%Y-%m-%d')}...")
+        print(f"  Found {len(results)} event(s)")
+        return results
+
     # =========================================================================
     # GRAPH API IMPLEMENTATION
     # =========================================================================
@@ -1301,6 +1584,78 @@ class OutlookClient:
         url = f"{GRAPH_API_BASE}/me/sendMail"
         self._graph._api_post(url, {"message": message})
         return True
+
+    def _get_events_graph(self, date_from, date_to, max_results) -> List[Dict]:
+        """Get calendar events via Microsoft Graph API."""
+        start_str = date_from.strftime("%Y-%m-%dT00:00:00Z")
+        end_str = (date_to + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+
+        params = {
+            "startdatetime": start_str,
+            "enddatetime": end_str,
+            "$select": "id,subject,start,end,location,organizer,isAllDay,showAs,body,attendees",
+            "$orderby": "start/dateTime",
+            "$top": min(max_results, 250),
+        }
+
+        url = f"{GRAPH_API_BASE}/me/calendarview"
+        query = "&".join(f"{k}={_url_quote(str(v), safe='/:,')}" for k, v in params.items())
+        full_url = f"{url}?{query}"
+
+        print(f"Scanning Outlook calendar: {date_from.strftime('%Y-%m-%d')} to {date_to.strftime('%Y-%m-%d')}...")
+
+        resp = self._graph._api_get(full_url)
+        events = resp.get("value", [])
+
+        results = []
+        for evt in events[:max_results]:
+            try:
+                start_dt = datetime.fromisoformat(
+                    evt["start"]["dateTime"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except (ValueError, KeyError):
+                start_dt = datetime.now()
+
+            try:
+                end_dt = datetime.fromisoformat(
+                    evt["end"]["dateTime"].replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except (ValueError, KeyError):
+                end_dt = start_dt
+
+            organizer = evt.get("organizer", {}).get("emailAddress", {})
+            show_as_map = {"free": "free", "tentative": "tentative",
+                           "busy": "busy", "oof": "out of office",
+                           "workingElsewhere": "working elsewhere"}
+
+            attendees = []
+            for att in evt.get("attendees", []):
+                ea = att.get("emailAddress", {})
+                resp_status = att.get("status", {}).get("response", "unknown")
+                attendees.append({
+                    "name": ea.get("name", ""),
+                    "email": ea.get("address", ""),
+                    "status": resp_status,
+                })
+
+            results.append({
+                "id": evt.get("id", ""),
+                "subject": evt.get("subject", "(No Subject)"),
+                "start_datetime": start_dt,
+                "end_datetime": end_dt,
+                "start_date": start_dt.strftime("%Y-%m-%d"),
+                "end_date": end_dt.strftime("%Y-%m-%d"),
+                "location": evt.get("location", {}).get("displayName", ""),
+                "organizer_name": organizer.get("name", ""),
+                "organizer_email": organizer.get("address", ""),
+                "is_all_day": evt.get("isAllDay", False),
+                "status": show_as_map.get(evt.get("showAs", ""), "busy"),
+                "body_preview": evt.get("body", {}).get("content", "")[:2000],
+                "attendees": attendees,
+            })
+
+        print(f"  Found {len(results)} event(s)")
+        return results
 
     # =========================================================================
     # POST-FILTERS (applied in Python, after backend fetch)

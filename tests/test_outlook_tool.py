@@ -6,6 +6,7 @@ logic: date parsing, domain extraction, post-filtering, and client initializatio
 """
 
 import re
+import unittest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -338,3 +339,145 @@ class TestSendValidation:
             client.send(to="single@example.com", subject="Test", body="Body")
             call_args = mock_send.call_args[0]
             assert call_args[0] == ["single@example.com"]  # to is now a list
+
+
+# ============================================================================
+# GET EVENTS TESTS
+# ============================================================================
+
+
+class TestGetEvents(unittest.TestCase):
+    """Tests for the calendar events API."""
+
+    SAMPLE_EVENTS = [
+        {
+            "id": "evt_1",
+            "subject": "Team Standup",
+            "start_datetime": datetime(2026, 3, 27, 9, 0),
+            "end_datetime": datetime(2026, 3, 27, 9, 30),
+            "start_date": "2026-03-27",
+            "end_date": "2026-03-27",
+            "location": "Conference Room A",
+            "organizer_name": "Jane Smith",
+            "organizer_email": "jane@example.com",
+            "is_all_day": False,
+            "status": "busy",
+            "body_preview": "Daily standup meeting.",
+            "attendees": [
+                {"name": "Bob", "email": "bob@example.com", "status": "accepted"},
+            ],
+        },
+        {
+            "id": "evt_2",
+            "subject": "Quarterly Review",
+            "start_datetime": datetime(2026, 3, 27, 14, 0),
+            "end_datetime": datetime(2026, 3, 27, 15, 0),
+            "start_date": "2026-03-27",
+            "end_date": "2026-03-27",
+            "location": "",
+            "organizer_name": "CEO",
+            "organizer_email": "ceo@example.com",
+            "is_all_day": False,
+            "status": "tentative",
+            "body_preview": "Q1 review.",
+            "attendees": [],
+        },
+        {
+            "id": "evt_3",
+            "subject": "Company Holiday",
+            "start_datetime": datetime(2026, 3, 28, 0, 0),
+            "end_datetime": datetime(2026, 3, 28, 23, 59),
+            "start_date": "2026-03-28",
+            "end_date": "2026-03-28",
+            "location": "",
+            "organizer_name": "",
+            "organizer_email": "",
+            "is_all_day": True,
+            "status": "free",
+            "body_preview": "",
+            "attendees": [],
+        },
+    ]
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_get_events_delegates_to_backend(self):
+        client = OutlookClient()
+        with patch.object(
+            client, "_get_events_win32", return_value=self.SAMPLE_EVENTS
+        ) as mock:
+            results = client.get_events(date_from="2026-03-27", date_to="2026-03-28")
+            mock.assert_called_once()
+            assert len(results) == 3
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_get_events_subject_filter(self):
+        client = OutlookClient()
+        with patch.object(
+            client, "_get_events_win32", return_value=self.SAMPLE_EVENTS
+        ):
+            results = client.get_events(
+                date_from="2026-03-27", subject_contains="standup"
+            )
+            assert len(results) == 1
+            assert results[0]["subject"] == "Team Standup"
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_get_events_subject_filter_case_insensitive(self):
+        client = OutlookClient()
+        with patch.object(
+            client, "_get_events_win32", return_value=self.SAMPLE_EVENTS
+        ):
+            results = client.get_events(
+                date_from="2026-03-27", subject_contains="QUARTERLY"
+            )
+            assert len(results) == 1
+            assert results[0]["subject"] == "Quarterly Review"
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_get_events_max_results(self):
+        client = OutlookClient()
+        with patch.object(
+            client, "_get_events_win32", return_value=self.SAMPLE_EVENTS
+        ):
+            results = client.get_events(date_from="2026-03-27", max_results=2)
+            assert len(results) == 2
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_get_events_defaults_to_today(self):
+        client = OutlookClient()
+        with patch.object(
+            client, "_get_events_win32", return_value=[]
+        ) as mock:
+            client.get_events()
+            call_args = mock.call_args[0]
+            # date_from should be today at midnight
+            assert call_args[0].date() == datetime.now().date()
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_get_events_default_end_is_7_days(self):
+        client = OutlookClient()
+        with patch.object(
+            client, "_get_events_win32", return_value=[]
+        ) as mock:
+            client.get_events(date_from="2026-03-27")
+            call_args = mock.call_args[0]
+            # date_to should be 7 days after date_from
+            assert call_args[1] == datetime(2026, 4, 3)
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_get_events_event_dict_structure(self):
+        client = OutlookClient()
+        with patch.object(
+            client, "_get_events_win32", return_value=self.SAMPLE_EVENTS
+        ):
+            results = client.get_events(date_from="2026-03-27")
+            evt = results[0]
+            # Check all required fields exist
+            required_fields = [
+                "id", "subject", "start_datetime", "end_datetime",
+                "start_date", "end_date", "location", "organizer_name",
+                "organizer_email", "is_all_day", "status", "body_preview",
+                "attendees",
+            ]
+            for field in required_fields:
+                assert field in evt, f"Missing field: {field}"
