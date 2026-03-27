@@ -1367,6 +1367,8 @@ class OutlookClient:
         items.IncludeRecurrences = True
         items = items.Restrict(restriction)
 
+        print(f"Scanning Outlook calendar: {date_from.strftime('%Y-%m-%d')} to {date_to.strftime('%Y-%m-%d')}...")
+
         results = []
         for i, item in enumerate(items):
             if len(results) >= max_results:
@@ -1391,12 +1393,12 @@ class OutlookClient:
                 try:
                     for r in range(1, item.Recipients.Count + 1):
                         recip = item.Recipients.Item(r)
-                        status_map = {0: "none", 1: "organizer", 2: "tentative",
-                                      3: "accepted", 4: "declined"}
+                        response_map = {0: "none", 1: "organizer", 2: "tentative",
+                                        3: "accepted", 4: "declined"}
                         attendees.append({
                             "name": recip.Name or "",
                             "email": recip.Address or "",
-                            "status": status_map.get(recip.MeetingResponseStatus, "unknown"),
+                            "status": response_map.get(recip.MeetingResponseStatus, "unknown"),
                         })
                 except Exception:
                     pass
@@ -1421,7 +1423,6 @@ class OutlookClient:
             except Exception:
                 continue
 
-        print(f"Scanning Outlook calendar: {date_from.strftime('%Y-%m-%d')} to {date_to.strftime('%Y-%m-%d')}...")
         print(f"  Found {len(results)} event(s)")
         return results
 

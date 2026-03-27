@@ -10,6 +10,7 @@ This tool runs **locally on your machine** and communicates directly with your O
 - Email subjects, senders, recipients, body text, and metadata
 - Email attachments (can save to disk)
 - Send emails as the signed-in Outlook user
+- Calendar events (subject, times, location, organizer, attendees, body)
 
 ### What the tool does NOT do
 

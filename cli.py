@@ -102,16 +102,17 @@ def cmd_events(args):
     client = OutlookClient()
 
     kwargs = {}
-    if args.date_from:
-        kwargs["date_from"] = args.date_from
-    if args.date_to:
-        kwargs["date_to"] = args.date_to
-    elif args.today:
+    if args.today:
         kwargs["date_from"] = datetime.now().strftime("%Y-%m-%d")
         kwargs["date_to"] = datetime.now().strftime("%Y-%m-%d")
     elif args.week:
         kwargs["date_from"] = datetime.now().strftime("%Y-%m-%d")
         kwargs["date_to"] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    else:
+        if args.date_from:
+            kwargs["date_from"] = args.date_from
+        if args.date_to:
+            kwargs["date_to"] = args.date_to
     if args.subject:
         kwargs["subject_contains"] = args.subject
     if args.max_results:
@@ -210,8 +211,9 @@ def main():
     sp = subparsers.add_parser("events", help="List calendar events")
     sp.add_argument("--from", dest="date_from", help="Start date (YYYY-MM-DD, default: today)")
     sp.add_argument("--to-date", dest="date_to", help="End date (YYYY-MM-DD, default: +7 days)")
-    sp.add_argument("--today", action="store_true", help="Show today's events only")
-    sp.add_argument("--week", action="store_true", help="Show this week's events")
+    range_group = sp.add_mutually_exclusive_group()
+    range_group.add_argument("--today", action="store_true", help="Show today's events only")
+    range_group.add_argument("--week", action="store_true", help="Show this week's events")
     sp.add_argument("--subject", help="Subject contains (case-insensitive)")
     sp.add_argument("--max-results", type=int, default=50, help="Max results (default 50)")
     sp.add_argument("--json", action="store_true", help="Output results as JSON")
