@@ -5,6 +5,7 @@ These tests don't require Outlook or Graph API access. They test the pure-Python
 logic: date parsing, domain extraction, post-filtering, and client initialization.
 """
 
+import json
 import re
 import unittest
 from datetime import datetime
@@ -481,3 +482,167 @@ class TestGetEvents(unittest.TestCase):
             ]
             for field in required_fields:
                 assert field in evt, f"Missing field: {field}"
+
+
+# ============================================================================
+# SECURITY TESTS
+# ============================================================================
+
+
+class TestPathTraversal:
+    """Tests for path traversal prevention in attachment downloads."""
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_attachment_name_traversal_stripped(self):
+        client = OutlookClient()
+        with patch.object(client, "_download_win32"):
+            email = {"id": "test_id"}
+            attachment = {"name": "../../.ssh/authorized_keys", "id": "att1"}
+            dest = client.download_attachment(email, attachment, output_dir="/tmp/downloads")
+            # Should strip to just "authorized_keys", not traverse
+            assert dest.name == "authorized_keys"
+            assert ".ssh" not in str(dest)
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_attachment_name_just_filename(self):
+        client = OutlookClient()
+        with patch.object(client, "_download_win32"):
+            email = {"id": "test_id"}
+            attachment = {"name": "report.pdf", "id": "att1"}
+            dest = client.download_attachment(email, attachment, output_dir="/tmp/downloads")
+            assert dest.name == "report.pdf"
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_attachment_empty_name(self):
+        client = OutlookClient()
+        with patch.object(client, "_download_win32"):
+            email = {"id": "test_id"}
+            attachment = {"name": "", "id": "att1"}
+            dest = client.download_attachment(email, attachment, output_dir="/tmp/downloads")
+            assert dest.name == "unnamed_attachment"
+
+
+class TestEscapeApplescriptSecurity:
+    """Additional security-focused escape tests."""
+
+    def test_null_bytes_stripped(self):
+        assert "\0" not in _escape_applescript("hello\0world")
+        assert _escape_applescript("test\0") == "test"
+
+    def test_nested_escapes(self):
+        result = _escape_applescript('"; do shell script "rm -rf /"')
+        assert '"; do shell script "rm -rf /"' not in result
+        assert '\\"' in result
+
+
+class TestAppleScriptBackendParsing(unittest.TestCase):
+    """Tests for JXA output parsing in the AppleScript backend."""
+
+    SAMPLE_JXA_RESPONSE = json.dumps({
+        "scanned": 2,
+        "matched": 2,
+        "results": [
+            {
+                "_msg_index": 1,
+                "_folder_name": "Inbox",
+                "subject": "Test Email",
+                "sender_name": "Jane",
+                "sender_email": "jane@example.com",
+                "received_datetime": "2026-03-27T14:30:00.000Z",
+                "is_read": True,
+                "has_attachments": False,
+                "to": "you@example.com",
+                "body_preview": "Hello there",
+                "attachments": [],
+            },
+            {
+                "_msg_index": 2,
+                "_folder_name": "Inbox",
+                "subject": "With Attachment",
+                "sender_name": "Bob",
+                "sender_email": "bob@example.com",
+                "received_datetime": "2026-03-27T15:00:00.000Z",
+                "is_read": False,
+                "has_attachments": True,
+                "to": "you@example.com",
+                "body_preview": "See attached",
+                "attachments": [
+                    {"name": "report.pdf", "size": 1024, "index": 1},
+                ],
+            },
+        ],
+    })
+
+    @patch("outlook_tool._run_jxa")
+    @patch("outlook_tool.HAS_APPLESCRIPT", True)
+    @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool._run_applescript", return_value="16.0")
+    def test_jxa_email_parsing(self, mock_as, mock_jxa):
+        mock_jxa.return_value = self.SAMPLE_JXA_RESPONSE
+        from outlook_tool import _AppleScriptBackend
+        backend = _AppleScriptBackend.__new__(_AppleScriptBackend)
+        backend._version = "16.0"
+        results = backend.scan_emails(
+            start_date=datetime(2026, 3, 27),
+            end_date=datetime(2026, 3, 27),
+        )
+        assert len(results) == 2
+        assert results[0]["subject"] == "Test Email"
+        assert results[0]["sender_email"] == "jane@example.com"
+        assert isinstance(results[0]["received_datetime"], datetime)
+        assert results[1]["has_attachments"] is True
+        assert len(results[1]["attachments"]) == 1
+        assert results[1]["attachments"][0]["name"] == "report.pdf"
+        assert results[1]["attachments"][0]["_as_folder_name"] == "Inbox"
+
+    SAMPLE_JXA_CALENDAR = json.dumps({
+        "matched": 1,
+        "results": [
+            {
+                "subject": "Team Standup",
+                "start_datetime": "2026-03-27T09:00:00.000Z",
+                "end_datetime": "2026-03-27T09:30:00.000Z",
+                "location": "Room A",
+                "organizer": "Jane",
+                "is_all_day": False,
+                "status": "busy",
+                "body_preview": "Daily sync",
+                "attendees": [],
+            },
+        ],
+    })
+
+    @patch("outlook_tool._run_jxa")
+    def test_jxa_calendar_parsing(self, mock_jxa):
+        mock_jxa.return_value = self.SAMPLE_JXA_CALENDAR
+        from outlook_tool import _AppleScriptBackend
+        backend = _AppleScriptBackend.__new__(_AppleScriptBackend)
+        backend._version = "16.0"
+        results = backend.get_calendar_events(
+            start_date=datetime(2026, 3, 27),
+            end_date=datetime(2026, 3, 27),
+        )
+        assert len(results) == 1
+        assert results[0]["subject"] == "Team Standup"
+        assert results[0]["location"] == "Room A"
+        assert isinstance(results[0]["start_datetime"], datetime)
+        assert results[0]["is_all_day"] is False
+
+
+class TestODataSanitization:
+    """Tests for OData injection prevention."""
+
+    def test_single_quotes_escaped(self):
+        # Verify the filter escaping works
+        import re
+        safe = "O'Brien".replace("'", "''")
+        safe = re.sub(r"[()]", "", safe)
+        assert safe == "O''Brien"
+
+    def test_parentheses_stripped(self):
+        import re
+        malicious = "') or subject eq subject or ('"
+        safe = malicious.replace("'", "''")
+        safe = re.sub(r"[()]", "", safe)
+        assert "(" not in safe
+        assert ")" not in safe

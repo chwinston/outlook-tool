@@ -60,32 +60,6 @@ def cmd_search(args):
 
     results = client.search(**kwargs)
 
-    print(f"\nFound {len(results)} email(s)\n")
-
-    for i, email in enumerate(results, 1):
-        att_count = len(email["attachments"])
-        att_info = f" [{att_count} attachment(s)]" if att_count > 0 else ""
-        print(f"  {i}. {email['received_date']} | {email['sender_name']} <{email['sender_email']}>")
-        print(f"     Subject: {email['subject']}{att_info}")
-        if email["attachments"]:
-            for att in email["attachments"]:
-                size_kb = att.get("size", 0) / 1024
-                print(f"       -> {att['name']} ({size_kb:.0f} KB)")
-        print()
-
-    # Download attachments if requested
-    if args.download and results:
-        download_dir = Path(args.download)
-        download_dir.mkdir(parents=True, exist_ok=True)
-        count = 0
-        for email in results:
-            for att in email["attachments"]:
-                dest = client.download_attachment(email, att, output_dir=download_dir)
-                print(f"  Downloaded: {dest}")
-                count += 1
-        print(f"\n  {count} attachment(s) downloaded to {download_dir}")
-
-    # JSON output if requested
     if args.json:
         serializable = []
         for e in results:
@@ -93,6 +67,31 @@ def cmd_search(args):
             entry["received_datetime"] = entry["received_datetime"].isoformat()
             serializable.append(entry)
         print(json.dumps(serializable, indent=2))
+    else:
+        print(f"\nFound {len(results)} email(s)\n")
+
+        for i, email in enumerate(results, 1):
+            att_count = len(email["attachments"])
+            att_info = f" [{att_count} attachment(s)]" if att_count > 0 else ""
+            print(f"  {i}. {email['received_date']} | {email['sender_name']} <{email['sender_email']}>")
+            print(f"     Subject: {email['subject']}{att_info}")
+            if email["attachments"]:
+                for att in email["attachments"]:
+                    size_kb = att.get("size", 0) / 1024
+                    print(f"       -> {att['name']} ({size_kb:.0f} KB)")
+            print()
+
+        # Download attachments if requested
+        if args.download and results:
+            download_dir = Path(args.download)
+            download_dir.mkdir(parents=True, exist_ok=True)
+            count = 0
+            for email in results:
+                for att in email["attachments"]:
+                    dest = client.download_attachment(email, att, output_dir=download_dir)
+                    print(f"  Downloaded: {dest}")
+                    count += 1
+            print(f"\n  {count} attachment(s) downloaded to {download_dir}")
 
     return results
 
@@ -120,27 +119,6 @@ def cmd_events(args):
 
     results = client.get_events(**kwargs)
 
-    print(f"\nFound {len(results)} event(s)\n")
-
-    for i, evt in enumerate(results, 1):
-        time_str = f"{evt['start_datetime'].strftime('%H:%M')}–{evt['end_datetime'].strftime('%H:%M')}"
-        if evt["is_all_day"]:
-            time_str = "All day"
-        loc = f" @ {evt['location']}" if evt["location"] else ""
-        org = f" (organized by {evt['organizer_name']})" if evt["organizer_name"] else ""
-
-        print(f"  {i}. {evt['start_date']} {time_str}{loc}")
-        print(f"     {evt['subject']}{org}")
-
-        if evt["attendees"]:
-            att_summary = ", ".join(
-                f"{a['name'] or a['email']} ({a['status']})"
-                for a in evt["attendees"][:5]
-            )
-            extra = f" +{len(evt['attendees']) - 5} more" if len(evt["attendees"]) > 5 else ""
-            print(f"     Attendees: {att_summary}{extra}")
-        print()
-
     if args.json:
         serializable = []
         for e in results:
@@ -149,6 +127,27 @@ def cmd_events(args):
             entry["end_datetime"] = entry["end_datetime"].isoformat()
             serializable.append(entry)
         print(json.dumps(serializable, indent=2))
+    else:
+        print(f"\nFound {len(results)} event(s)\n")
+
+        for i, evt in enumerate(results, 1):
+            time_str = f"{evt['start_datetime'].strftime('%H:%M')}–{evt['end_datetime'].strftime('%H:%M')}"
+            if evt["is_all_day"]:
+                time_str = "All day"
+            loc = f" @ {evt['location']}" if evt["location"] else ""
+            org = f" (organized by {evt['organizer_name']})" if evt["organizer_name"] else ""
+
+            print(f"  {i}. {evt['start_date']} {time_str}{loc}")
+            print(f"     {evt['subject']}{org}")
+
+            if evt["attendees"]:
+                att_summary = ", ".join(
+                    f"{a['name'] or a['email']} ({a['status']})"
+                    for a in evt["attendees"][:5]
+                )
+                extra = f" +{len(evt['attendees']) - 5} more" if len(evt["attendees"]) > 5 else ""
+                print(f"     Attendees: {att_summary}{extra}")
+            print()
 
     return results
 

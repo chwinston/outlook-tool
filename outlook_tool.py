@@ -40,6 +40,7 @@ Usage:
     )
 """
 
+import hashlib
 import os
 import re
 import sys
@@ -96,6 +97,7 @@ def _escape_applescript(s: str) -> str:
     Handles backslashes, double quotes, newlines, carriage returns, and tabs
     to prevent command injection via crafted email addresses, subjects, or paths.
     """
+    s = s.replace("\0", "")  # Strip null bytes
     s = s.replace("\\", "\\\\")
     s = s.replace('"', '\\"')
     s = s.replace("\n", "\\n")
@@ -301,7 +303,7 @@ class _AppleScriptBackend:
         """
 
         display_folder = folder_name or "Inbox"
-        print(f"Scanning Outlook {display_folder}: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}...")
+        print(f"Scanning Outlook {display_folder}: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}...", file=sys.stderr)
 
         raw = _run_jxa(jxa_script, timeout=180)
         data = json.loads(raw)
@@ -309,7 +311,7 @@ class _AppleScriptBackend:
         if "error" in data:
             raise ValueError(data["error"])
 
-        print(f"  Scanned {data['scanned']} messages, found {data['matched']} matches")
+        print(f"  Scanned {data['scanned']} messages, found {data['matched']} matches", file=sys.stderr)
 
         results = []
         for email in data["results"]:
@@ -358,6 +360,8 @@ class _AppleScriptBackend:
         folder_name: Optional[str] = None,
     ) -> bool:
         """Save an attachment to disk via AppleScript."""
+        msg_index = int(msg_index)
+        att_index = int(att_index)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         save_path = _escape_applescript(str(output_path.resolve()))
 
@@ -531,7 +535,7 @@ end tell
         }})();
         """
 
-        print(f"Scanning Outlook calendar: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}...")
+        print(f"Scanning Outlook calendar: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}...", file=sys.stderr)
 
         raw = _run_jxa(jxa_script, timeout=180)
         data = json.loads(raw)
@@ -539,7 +543,7 @@ end tell
         if "error" in data:
             raise ValueError(data["error"])
 
-        print(f"  Found {data['matched']} event(s)")
+        print(f"  Found {data['matched']} event(s)", file=sys.stderr)
 
         results = []
         for evt in data["results"]:
@@ -558,7 +562,7 @@ end tell
                 end_dt = start_dt
 
             results.append({
-                "id": f"as_evt_{hash(evt['subject'] + evt['start_datetime'])}",
+                "id": f"as_evt_{hashlib.md5((evt['subject'] + evt['start_datetime']).encode()).hexdigest()[:12]}",
                 "subject": evt.get("subject", "(No Subject)"),
                 "start_datetime": start_dt,
                 "end_datetime": end_dt,
@@ -634,8 +638,23 @@ class _GraphBackend:
 
     def _save_cache(self):
         if self._cache.has_state_changed:
-            self.token_cache_path.write_text(self._cache.serialize())
-            os.chmod(self.token_cache_path, 0o600)
+            import tempfile
+            cache_dir = str(self.token_cache_path.parent)
+            fd = None
+            tmp_path = None
+            try:
+                fd, tmp_path = tempfile.mkstemp(dir=cache_dir, prefix=".token_cache_")
+                os.fchmod(fd, 0o600)
+                os.write(fd, self._cache.serialize().encode())
+                os.close(fd)
+                fd = None
+                os.rename(tmp_path, str(self.token_cache_path))
+            except Exception:
+                if fd is not None:
+                    os.close(fd)
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
 
     def _acquire_token(self) -> str:
         accounts = self._app.get_accounts()
@@ -676,21 +695,31 @@ class _GraphBackend:
             "Content-Type": "application/json",
         }
 
-    def _api_get(self, url: str, params: Optional[dict] = None) -> dict:
-        resp = _requests.get(url, headers=self._headers(), params=params)
-        if resp.status_code == 401:
-            self._token = None
-            resp = _requests.get(url, headers=self._headers(), params=params)
-        resp.raise_for_status()
-        return resp.json()
+    def _api_request(self, method: str, url: str, **kwargs) -> _requests.Response:
+        """Make a Graph API request with timeout, 401 retry, and 429 backoff."""
+        import time as _time
+        kwargs.setdefault("timeout", 30)
+        kwargs["headers"] = self._headers()
 
-    def _api_post(self, url: str, json_body: dict):
-        resp = _requests.post(url, headers=self._headers(), json=json_body)
-        if resp.status_code == 401:
-            self._token = None
-            resp = _requests.post(url, headers=self._headers(), json=json_body)
+        for attempt in range(3):
+            resp = getattr(_requests, method)(url, **kwargs)
+            if resp.status_code == 401 and attempt == 0:
+                self._token = None
+                kwargs["headers"] = self._headers()
+                continue
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
+                _time.sleep(min(retry_after, 30))
+                continue
+            break
         resp.raise_for_status()
         return resp
+
+    def _api_get(self, url: str, params: Optional[dict] = None) -> dict:
+        return self._api_request("get", url, params=params).json()
+
+    def _api_post(self, url: str, json_body: dict):
+        return self._api_request("post", url, json=json_body)
 
     def upgrade_scopes(self, scopes: List[str]):
         """Re-authenticate with broader scopes if needed."""
@@ -858,71 +887,58 @@ class OutlookClient:
                         folder_set.append(f)
             all_folders = folder_set
 
-        if self.backend == "win32com":
-            if all_folders and len(all_folders) > 1:
-                results = []
-                for fn in all_folders:
-                    results.extend(self._search_win32(
-                        date_from=date_from, date_to=date_to,
-                        subject_contains=subject_contains,
-                        has_attachments=has_attachments, folder=fn,
-                        is_read=is_read, importance=importance,
-                        max_results=max_results,
-                    ))
-                results.sort(key=lambda e: e["received_datetime"], reverse=True)
-            else:
-                results = self._search_win32(
+        def _search_single_folder(folder_name):
+            """Dispatch a single-folder search to the active backend."""
+            if self.backend == "win32com":
+                return self._search_win32(
                     date_from=date_from, date_to=date_to,
                     subject_contains=subject_contains,
-                    has_attachments=has_attachments,
-                    folder=all_folders[0] if all_folders else None,
+                    has_attachments=has_attachments, folder=folder_name,
                     is_read=is_read, importance=importance,
                     max_results=max_results,
                 )
-        elif self.backend == "applescript":
-            results = self._search_applescript(
-                date_from=date_from,
-                date_to=date_to,
-                has_attachments=has_attachments,
-                sender_domains=all_domains if all_domains else None,
-                max_results=max_results,
-                folder=all_folders[0] if all_folders and len(all_folders) == 1 else None,
-                folders=all_folders if all_folders and len(all_folders) > 1 else None,
-            )
-        else:
-            if all_folders and len(all_folders) > 1:
-                results = []
-                for fn in all_folders:
-                    results.extend(self._search_graph(
-                        date_from=date_from, date_to=date_to,
-                        subject_contains=subject_contains,
-                        has_attachments=has_attachments, folder=fn,
-                        is_read=is_read, body_contains=body_contains,
-                        importance=importance, max_results=max_results,
-                    ))
-                results.sort(key=lambda e: e["received_datetime"], reverse=True)
+            elif self.backend == "applescript":
+                return self._search_applescript(
+                    date_from=date_from, date_to=date_to,
+                    has_attachments=has_attachments,
+                    sender_domains=all_domains if all_domains else None,
+                    max_results=max_results, folder=folder_name,
+                )
             else:
-                results = self._search_graph(
+                return self._search_graph(
                     date_from=date_from, date_to=date_to,
                     subject_contains=subject_contains,
-                    has_attachments=has_attachments,
-                    folder=all_folders[0] if all_folders else None,
+                    has_attachments=has_attachments, folder=folder_name,
                     is_read=is_read, body_contains=body_contains,
                     importance=importance, max_results=max_results,
                 )
 
-        # Apply post-filters that both backends handle uniformly in Python
+        if all_folders and len(all_folders) > 1:
+            results = []
+            for fn in all_folders:
+                results.extend(_search_single_folder(fn))
+            results.sort(key=lambda e: e["received_datetime"], reverse=True)
+        else:
+            results = _search_single_folder(
+                all_folders[0] if all_folders else None
+            )
+
+        # Apply post-filters uniformly in Python.
+        # Note: subject_contains is already applied server-side by Graph backend,
+        # but not by win32/applescript — apply it here for consistency.
+        # subject_matches (regex) is always post-filtered.
         results = self._apply_post_filters(
             results,
-            subject_contains=subject_contains,
+            subject_contains=subject_contains if self.backend != "graph" else None,
             subject_matches=subject_matches,
             sender_name=sender_name,
             sender_email=sender_email,
             sender_domains=all_domains if all_domains else None,
-            body_contains=body_contains,
+            body_contains=body_contains if self.backend != "graph" else None,
             to_contains=to_contains,
         )
 
+        # Truncate AFTER post-filters so filters don't reduce below max_results
         return results[:max_results]
 
     # -------------------------------------------------------------------------
@@ -956,7 +972,12 @@ class OutlookClient:
         if output_path:
             dest = Path(output_path)
         elif output_dir:
-            dest = Path(output_dir) / attachment["name"]
+            # Sanitize attachment filename to prevent path traversal attacks
+            # (e.g., "../../.ssh/authorized_keys" from a malicious sender)
+            safe_name = Path(attachment["name"]).name
+            if not safe_name:
+                safe_name = "unnamed_attachment"
+            dest = Path(output_dir) / safe_name
         else:
             raise ValueError("Specify either output_dir or output_path")
 
@@ -1021,6 +1042,13 @@ class OutlookClient:
         if self.backend == "win32com":
             return self._send_win32(to, subject, body, cc, bcc, att_paths, html, importance)
         elif self.backend == "applescript":
+            if importance and importance.lower() != "normal":
+                import warnings
+                warnings.warn(
+                    f"Importance '{importance}' is not supported by the AppleScript backend "
+                    "and will be ignored. The email will be sent with normal importance.",
+                    stacklevel=2,
+                )
             return self._send_applescript(to, subject, body, cc, bcc, att_paths, html)
         else:
             return self._send_graph(to, subject, body, cc, bcc, att_paths, html, importance)
@@ -1088,39 +1116,21 @@ class OutlookClient:
 
     def _search_applescript(
         self, date_from, date_to, has_attachments, sender_domains, max_results,
-        folder=None, folders=None,
+        folder=None,
     ) -> List[Dict]:
         """Search emails via AppleScript/JXA (Outlook for Mac Legacy)."""
         start = date_from or datetime(2000, 1, 1)
         end = date_to or datetime.now()
         domain_list = list(sender_domains) if sender_domains else None
 
-        # Build list of folders to scan
-        folder_list: List[Optional[str]] = []
-        if folders:
-            folder_list = list(folders)
-        elif folder:
-            folder_list = [folder]
-        else:
-            folder_list = [None]  # Default: Inbox
-
-        all_results: List[Dict] = []
-        for fn in folder_list:
-            results = self._applescript.scan_emails(
-                start_date=start,
-                end_date=end,
-                sender_domains=domain_list,
-                only_with_attachments=has_attachments,
-                max_results=max_results,
-                folder_name=fn,
-            )
-            all_results.extend(results)
-
-        # Sort by date descending (newest first) when searching multiple folders
-        if len(folder_list) > 1:
-            all_results.sort(key=lambda e: e["received_datetime"], reverse=True)
-
-        return all_results
+        return self._applescript.scan_emails(
+            start_date=start,
+            end_date=end,
+            sender_domains=domain_list,
+            only_with_attachments=has_attachments,
+            max_results=max_results,
+            folder_name=folder,
+        )
 
     def _download_applescript(self, email: Dict, attachment: Dict, dest: Path):
         """Download attachment via AppleScript."""
@@ -1189,6 +1199,8 @@ class OutlookClient:
         date_from, date_to, subject_contains, has_attachments,
         folder, is_read, importance, max_results,
     ) -> List[Dict]:
+        # Clear COM object cache from previous searches to prevent memory leaks
+        self._win32_msg_cache.clear()
         """Search emails via win32com Outlook COM."""
         outlook_folder = self._get_win32_folder(folder)
 
@@ -1296,10 +1308,10 @@ class OutlookClient:
                 results.append(email_dict)
 
                 if (i + 1) % 100 == 0:
-                    print(f"  Scanned {i + 1} emails...")
+                    print(f"  Scanned {i + 1} emails...", file=sys.stderr)
 
             except Exception as e:
-                print(f"  Warning: Error processing email {i}: {e}")
+                print(f"  Warning: Error processing email {i}: {e}", file=sys.stderr)
                 continue
 
         return results
@@ -1367,7 +1379,7 @@ class OutlookClient:
         items.IncludeRecurrences = True
         items = items.Restrict(restriction)
 
-        print(f"Scanning Outlook calendar: {date_from.strftime('%Y-%m-%d')} to {date_to.strftime('%Y-%m-%d')}...")
+        print(f"Scanning Outlook calendar: {date_from.strftime('%Y-%m-%d')} to {date_to.strftime('%Y-%m-%d')}...", file=sys.stderr)
 
         results = []
         for i, item in enumerate(items):
@@ -1423,7 +1435,7 @@ class OutlookClient:
             except Exception:
                 continue
 
-        print(f"  Found {len(results)} event(s)")
+        print(f"  Found {len(results)} event(s)", file=sys.stderr)
         return results
 
     # =========================================================================
@@ -1450,7 +1462,10 @@ class OutlookClient:
         if importance:
             filters.append(f"importance eq '{importance.lower()}'")
         if subject_contains:
+            # Sanitize for OData: escape single quotes and strip parentheses
+            # to prevent OData filter injection
             safe = subject_contains.replace("'", "''")
+            safe = re.sub(r"[()]", "", safe)
             filters.append(f"contains(subject, '{safe}')")
 
         filter_str = " and ".join(filters) if filters else None
@@ -1530,10 +1545,9 @@ class OutlookClient:
 
     def _download_graph(self, email: Dict, attachment: Dict, dest: Path):
         """Download attachment via Graph API."""
-        url = (
-            f"{GRAPH_API_BASE}/me/messages/{email['id']}"
-            f"/attachments/{attachment['id']}/$value"
-        )
+        msg_id = _url_quote(str(email['id']), safe='')
+        att_id = _url_quote(str(attachment['id']), safe='')
+        url = f"{GRAPH_API_BASE}/me/messages/{msg_id}/attachments/{att_id}/$value"
         resp = _requests.get(url, headers=self._graph._headers())
         if resp.status_code == 401:
             self._graph._token = None
@@ -1603,7 +1617,7 @@ class OutlookClient:
         query = "&".join(f"{k}={_url_quote(str(v), safe='/:,')}" for k, v in params.items())
         full_url = f"{url}?{query}"
 
-        print(f"Scanning Outlook calendar: {date_from.strftime('%Y-%m-%d')} to {date_to.strftime('%Y-%m-%d')}...")
+        print(f"Scanning Outlook calendar: {date_from.strftime('%Y-%m-%d')} to {date_to.strftime('%Y-%m-%d')}...", file=sys.stderr)
 
         resp = self._graph._api_get(full_url)
         events = resp.get("value", [])
@@ -1655,7 +1669,7 @@ class OutlookClient:
                 "attendees": attendees,
             })
 
-        print(f"  Found {len(results)} event(s)")
+        print(f"  Found {len(results)} event(s)", file=sys.stderr)
         return results
 
     # =========================================================================
