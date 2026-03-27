@@ -1,6 +1,14 @@
 # Outlook Tool
 
-Search your Outlook emails, download attachments, and send emails — all from Python scripts or the command line. Works on both Windows and Mac.
+Search emails, view calendar events, download attachments, and send emails — all from Python scripts or the command line. Works on both Windows and Mac, no API keys required.
+
+**What you can do:**
+- Search emails across any folder (Inbox, Archive, Sent Items, etc.)
+- Search multiple folders at once and merge results
+- Download email attachments in bulk
+- View calendar events with attendees and locations
+- Send emails with attachments, CC/BCC, and importance levels
+- Output everything as JSON for scripting
 
 ---
 
@@ -199,7 +207,7 @@ This creates a `my-downloads` folder and saves all attachments from matching ema
 # Show today's events
 outlook-tool events --today
 
-# Show this week's events
+# Show this week's events (next 7 days)
 outlook-tool events --week
 
 # Events in a specific date range
@@ -211,6 +219,8 @@ outlook-tool events --from 2026-03-01 --subject "standup"
 # Get events as JSON
 outlook-tool events --from 2026-03-27 --json
 ```
+
+Each event shows the date, time range (or "All day"), location, subject, organizer, and attendees with their response status (accepted, tentative, declined).
 
 ### Send Emails
 
@@ -268,6 +278,13 @@ events = client.get_events(
 )
 for evt in events:
     print(f"{evt['start_date']} {evt['start_datetime'].strftime('%H:%M')} — {evt['subject']}")
+
+# Filter calendar events by subject
+meetings = client.get_events(
+    date_from="2026-03-24",
+    date_to="2026-03-28",
+    subject_contains="standup",
+)
 
 # Search across multiple folders
 emails = client.search(
@@ -375,6 +392,69 @@ Every filter is optional. When you use multiple filters, only emails matching **
 | Download attachments | `--download` | `--download ./my-folder` |
 | Output as JSON | `--json` | `--json` |
 
+## All Calendar Filters
+
+| What you want to filter by | CLI flag | Example |
+|---|---|---|
+| Start date | `--from` | `--from 2026-03-01` |
+| End date | `--to-date` | `--to-date 2026-03-31` |
+| Today's events only | `--today` | `--today` |
+| This week's events | `--week` | `--week` |
+| Subject keyword | `--subject` | `--subject "standup"` |
+| Limit results | `--max-results` | `--max-results 10` |
+| Output as JSON | `--json` | `--json` |
+
+> **Note:** `--today` and `--week` are convenience shortcuts. They cannot be combined with each other or with `--from`/`--to-date`. If no date is specified, events default to the next 7 days.
+
+---
+
+## What Each Result Looks Like
+
+### Email result (from `search()`)
+
+```python
+{
+    "id": "...",
+    "subject": "Quarterly Report",
+    "sender_name": "Jane Smith",
+    "sender_email": "jane@example.com",
+    "received_datetime": datetime(2026, 3, 10, 14, 30),
+    "received_date": "2026-03-10",
+    "day_of_week": "Tuesday",
+    "is_read": True,
+    "has_attachments": True,
+    "importance": "normal",
+    "body_preview": "First 5000 characters of the email body...",
+    "to": "you@example.com",
+    "attachments": [
+        {"id": "...", "name": "report.pdf", "size": 102400},
+    ],
+}
+```
+
+### Calendar event result (from `get_events()`)
+
+```python
+{
+    "id": "...",
+    "subject": "Team Standup",
+    "start_datetime": datetime(2026, 3, 27, 9, 0),
+    "end_datetime": datetime(2026, 3, 27, 9, 30),
+    "start_date": "2026-03-27",
+    "end_date": "2026-03-27",
+    "location": "Conference Room A",
+    "organizer_name": "Jane Smith",
+    "organizer_email": "jane@example.com",
+    "is_all_day": False,
+    "status": "busy",           # busy, free, tentative, out of office
+    "body_preview": "Daily standup...",
+    "attendees": [
+        {"name": "Bob", "email": "bob@example.com", "status": "accepted"},
+        {"name": "Alice", "email": "alice@example.com", "status": "tentative"},
+    ],
+}
+```
+
 ---
 
 ## Troubleshooting
@@ -398,6 +478,11 @@ Every filter is optional. When you use multiple filters, only emails matching **
 - Try a broader search first (just `--from` with no other filters) to confirm things work
 - By default, only the **Inbox** folder is searched. If your emails are in Archive, Snoozed, or other folders, use `--folders Inbox Archive Snoozed` to search multiple folders at once
 
+### Calendar events not showing up
+- Make sure your Outlook calendar has events synced for the date range you're searching
+- The tool searches your default calendar on your primary Exchange account
+- Try `outlook-tool events --today` to verify calendar access is working
+
 ### Virtual environment issues
 - If `pip install` gives errors, make sure you see `(.venv)` in your terminal prompt
 - If not, re-run the activate command for your platform
@@ -418,3 +503,9 @@ If dependencies changed, re-install:
 # Activate your virtual environment first, then:
 pip install -r requirements.txt
 ```
+
+---
+
+## Security
+
+This tool runs locally and talks directly to your Outlook app. No data is sent to external servers. See [SECURITY.md](SECURITY.md) for details on the trust model, credential handling, and how to report vulnerabilities.
