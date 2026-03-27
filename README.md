@@ -216,11 +216,14 @@ outlook-tool events --from 2026-03-24 --to-date 2026-03-28
 # Filter events by subject
 outlook-tool events --from 2026-03-01 --subject "standup"
 
+# Show meeting notes/descriptions
+outlook-tool events --today --body
+
 # Get events as JSON
 outlook-tool events --from 2026-03-27 --json
 ```
 
-Each event shows the date, time range (or "All day"), location, subject, organizer, and attendees with their response status (accepted, tentative, declined).
+Each event shows the date, time range (or "All day"), location, subject, organizer, and attendees with their response status (accepted, tentative, declined). Use `--body` to also display the meeting description/notes.
 
 ### Send Emails
 
@@ -401,6 +404,7 @@ Every filter is optional. When you use multiple filters, only emails matching **
 | Today's events only | `--today` | `--today` |
 | This week's events | `--week` | `--week` |
 | Subject keyword | `--subject` | `--subject "standup"` |
+| Show meeting notes | `--body` | `--body` |
 | Limit results | `--max-results` | `--max-results 10` |
 | Output as JSON | `--json` | `--json` |
 

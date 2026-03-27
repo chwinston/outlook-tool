@@ -147,6 +147,16 @@ def cmd_events(args):
                 )
                 extra = f" +{len(evt['attendees']) - 5} more" if len(evt["attendees"]) > 5 else ""
                 print(f"     Attendees: {att_summary}{extra}")
+
+            if args.show_body and evt.get("body_preview", "").strip():
+                body = evt["body_preview"].strip()
+                # Collapse excessive blank lines
+                while "\n\n\n" in body:
+                    body = body.replace("\n\n\n", "\n\n")
+                # Indent each line under the event
+                for line in body.split("\n"):
+                    print(f"     | {line}")
+
             print()
 
     return results
@@ -215,6 +225,7 @@ def main():
     range_group.add_argument("--week", action="store_true", help="Show this week's events")
     sp.add_argument("--subject", help="Subject contains (case-insensitive)")
     sp.add_argument("--max-results", type=int, default=50, help="Max results (default 50)")
+    sp.add_argument("--body", dest="show_body", action="store_true", help="Show meeting notes/description")
     sp.add_argument("--json", action="store_true", help="Output results as JSON")
     sp.set_defaults(func=cmd_events)
 
