@@ -130,6 +130,7 @@ The `search()` method and `outlook-tool search` CLI accept these filters (all op
 | Multiple domains | `sender_domains=[]` | `--domains` |
 | Has attachments | `has_attachments=True` | `--has-attachments` |
 | Folder | `folder=` | `--folder` |
+| Multiple folders | `folders=[]` | `--folders` |
 | Read/unread | `is_read=` | `--unread` / `--read` |
 | Body keyword | `body_contains=` | `--body` |
 | Recipient | `to_contains=` | `--to` |
@@ -203,7 +204,7 @@ Every email from `search()` returns:
 pytest tests/ -v
 ```
 
-34 unit tests covering helpers, post-filters, platform detection, and input validation. Tests do not require Outlook — they mock the backends.
+43+ unit tests covering helpers, post-filters, platform detection, and input validation. Tests do not require Outlook — they mock the backends.
 
 ## Key Design Decisions
 
@@ -212,3 +213,5 @@ pytest tests/ -v
 - **All search results are plain dicts** — no COM objects or opaque handles leak out. Results are safe to serialize, print, or pass around.
 - **Post-filters in Python** — some filters (subject regex, sender name, body contains) are applied in Python after the backend fetch, so they work identically across all backends.
 - **`backend=` kwarg** — advanced users can force a specific backend: `OutlookClient(backend="graph")`.
+- **Multi-folder search** — `folders=["Inbox", "Archive", "Snoozed"]` searches multiple folders and merges results sorted by date. Follows the same pattern as `sender_domain`/`sender_domains`. Attachment downloads are folder-aware (tracked via `_as_folder_name`).
+- **Calendar support** — `get_events()` method and `outlook-tool events` CLI command for searching calendar events by date range across all three backends.

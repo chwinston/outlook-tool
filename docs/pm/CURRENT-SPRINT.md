@@ -1,33 +1,43 @@
 # Current Sprint
 
-## Bolt 1 — Security Hardening & Critical Bug Fixes
+## Bolt 2 — DLC Hardening + Calendar Support
 
-**Status:** COMPLETE
-**Goal:** Fix all Critical and High findings from the Staff Engineer Panel review (F1-F5), plus Medium findings (F6-F8), dead dependency (F9), CI pipeline, and new tests.
+**Status:** IN PROGRESS
+**Goal:** Close DLC audit gaps (D2, D5, D8 improvements), then add calendar event search to all 3 backends with CLI and Python API support.
 **Opened:** 2026-03-27
-**Completed:** 2026-03-27
+**Branch:** bolt/20260327-dlc-hardening-calendar-support
 
 ---
 
-### Items
+### Phase 1: DLC Audit Fixes (D2, D5, D8)
 
-| # | Item | Size | Status | Finding |
-|---|------|------|--------|---------|
-| 1 | Fix AppleScript command injection in `send_email()` | M | done | F1 (Critical) |
-| 2 | Fix AppleScript injection in `save_attachment()` | S | done | F2 (Critical) |
-| 3 | Expand AppleScript escaping (newlines, tabs, special chars) | S | done | F3 (High) |
-| 4 | Fix `_requests` import scoping — module crashes on Mac | S | done | F4 (High) |
-| 5 | Fix token cache file permissions (chmod 0600) | S | done | F5 (High) |
-| 6 | Fix JXA scan loop `break` assumption | S | done | F6 (Medium) |
-| 7 | URL-encode Graph API folder name | S | done | F7 (Medium) |
-| 8 | Add pagination circuit breaker to Graph API | S | done | F8 (Medium) |
-| 9 | Remove dead `openpyxl` from requirements.txt | S | done | F9 (Low) |
-| 10 | Add GitHub Actions CI (ruff + pytest) | M | done | Panel recommendation |
-| 11 | Add tests for `_escape_applescript` helper | S | done | Test coverage for F1-F3 |
+| # | Item | Size | Status | Dimension |
+|---|------|------|--------|-----------|
+| 1 | Fill SECURITY.md TODOs (contact email, Graph API scope verification) | S | todo | D5 Security |
+| 2 | Update claude-instructions.md with multi-folder search + calendar features | S | todo | D8 Evolution |
+| 3 | Prioritize requirements in docs/REQUIREMENTS.md | S | todo | D2 Requirements |
+| 4 | Run /security-audit for formal dated findings | M | todo | D5 Security |
 
-### Metrics
+### Phase 2: Calendar Support (via /staff-panel)
 
-- Commits this bolt: pending (not yet committed)
-- Tests: 43 (was 34, +9 new escape tests, all passing)
-- Files changed: 3 (outlook_tool.py, requirements.txt, tests/test_outlook_tool.py)
-- Files added: 3 (CI workflow, PM docs)
+| # | Item | Size | Status | Notes |
+|---|------|------|--------|-------|
+| 5 | Staff panel: calendar architecture decisions | — | todo | Design before code |
+| 6 | Add get_events() to AppleScript/JXA backend | M | todo | Primary Mac backend |
+| 7 | Add get_events() to Win32 COM backend | M | todo | Windows backend |
+| 8 | Add get_events() to Graph API backend | M | todo | Fallback backend |
+| 9 | Add get_events() to OutlookClient (unified API) | M | todo | Delegates to backends |
+| 10 | Add `events` CLI command | S | todo | outlook-tool events --from ... |
+| 11 | Update README with calendar examples | S | todo | Preserve existing content |
+| 12 | Add calendar tests | M | todo | Mock-based, no Outlook needed |
+
+### Success Criteria
+
+- [ ] SECURITY.md has no TODO markers
+- [ ] claude-instructions.md reflects current feature set
+- [ ] Requirements prioritized with MoSCoW
+- [ ] Security audit completed with dated findings
+- [ ] `outlook-tool events --from 2026-03-27 --to-date 2026-03-28` returns calendar events
+- [ ] `client.get_events(date_from="2026-03-27")` works in Python
+- [ ] All 3 backends support calendar search
+- [ ] Tests pass (existing + new calendar tests)
