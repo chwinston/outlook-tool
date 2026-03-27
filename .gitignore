@@ -20,3 +20,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Private email summaries
+docs/email-summaries/

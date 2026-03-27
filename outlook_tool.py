@@ -155,19 +155,51 @@ class _AppleScriptBackend:
         sender_domains: Optional[List[str]] = None,
         only_with_attachments: Optional[bool] = None,
         max_results: int = 250,
+        folder_name: Optional[str] = None,
     ) -> List[Dict]:
-        """Scan inbox for emails within date range via JXA."""
+        """Scan a mail folder for emails within date range via JXA.
+
+        Args:
+            folder_name: Folder to scan (default: Inbox). Must match the exact
+                folder name as it appears in Outlook (e.g., "Archive", "Snoozed",
+                "Sent Items", "Deleted Items", "Junk Email", "Drafts").
+        """
         domain_filter_js = "null"
         if sender_domains:
             domain_filter_js = json.dumps([d.lower() for d in sender_domains])
 
         att_filter = "true" if only_with_attachments else "false"
+        safe_folder = json.dumps(folder_name) if folder_name else "null"
 
         jxa_script = f"""
         (function() {{
             var outlook = Application("Microsoft Outlook");
-            var inbox = outlook.inbox;
-            var msgCount = inbox.messages.length;
+            var folderName = {safe_folder};
+            var folder;
+            if (!folderName || folderName.toLowerCase() === "inbox") {{
+                folder = outlook.inbox;
+            }} else {{
+                var accts = outlook.exchangeAccounts();
+                if (accts.length === 0) {{
+                    return JSON.stringify({{error: "No Exchange account found"}});
+                }}
+                var acct = accts[0];
+                var allFolders = acct.mailFolders();
+                var found = false;
+                for (var fi = 0; fi < allFolders.length; fi++) {{
+                    try {{
+                        if (allFolders[fi].name() === folderName) {{
+                            folder = allFolders[fi];
+                            found = true;
+                            break;
+                        }}
+                    }} catch(e) {{}}
+                }}
+                if (!found) {{
+                    return JSON.stringify({{error: "Folder not found: " + folderName}});
+                }}
+            }}
+            var msgCount = folder.messages.length;
 
             var startMs = {int(start_date.timestamp() * 1000)};
             var endMs = {int((end_date + timedelta(days=1)).timestamp() * 1000)};
@@ -178,10 +210,10 @@ class _AppleScriptBackend:
             var results = [];
             var scanned = 0;
 
-            for (var i = 0; i < msgCount && i < 5000; i++) {{
+            for (var i = 0; i < msgCount && i < 10000; i++) {{
                 if (results.length >= maxResults) break;
                 try {{
-                    var msg = inbox.messages[i];
+                    var msg = folder.messages[i];
                     var recvDate = msg.timeReceived();
                     if (!recvDate) continue;
 
@@ -243,6 +275,7 @@ class _AppleScriptBackend:
 
                     results.push({{
                         _msg_index: i + 1,
+                        _folder_name: folderName || "Inbox",
                         subject: subject,
                         sender_name: senderName,
                         sender_email: senderAddr,
@@ -267,10 +300,14 @@ class _AppleScriptBackend:
         }})();
         """
 
-        print(f"Scanning Outlook inbox: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}...")
+        display_folder = folder_name or "Inbox"
+        print(f"Scanning Outlook {display_folder}: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}...")
 
         raw = _run_jxa(jxa_script, timeout=180)
         data = json.loads(raw)
+
+        if "error" in data:
+            raise ValueError(data["error"])
 
         print(f"  Scanned {data['scanned']} messages, found {data['matched']} matches")
 
@@ -285,6 +322,8 @@ class _AppleScriptBackend:
 
             sender_email_addr = email.get("sender_email", "")
 
+            email_folder = email.get("_folder_name", "Inbox")
+
             att_list = []
             for att in email.get("attachments", []):
                 att_list.append({
@@ -293,6 +332,7 @@ class _AppleScriptBackend:
                     "size": att.get("size", 0),
                     "_as_msg_index": email["_msg_index"],
                     "_as_att_index": att["index"],
+                    "_as_folder_name": email_folder,
                 })
 
             results.append({
@@ -313,14 +353,23 @@ class _AppleScriptBackend:
 
         return results
 
-    def save_attachment(self, msg_index: int, att_index: int, output_path: Path) -> bool:
+    def save_attachment(
+        self, msg_index: int, att_index: int, output_path: Path,
+        folder_name: Optional[str] = None,
+    ) -> bool:
         """Save an attachment to disk via AppleScript."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
         save_path = _escape_applescript(str(output_path.resolve()))
 
+        if not folder_name or folder_name.lower() == "inbox":
+            folder_ref = "inbox"
+        else:
+            safe_name = _escape_applescript(folder_name)
+            folder_ref = f'mail folder "{safe_name}" of (first exchange account)'
+
         script = f'''
 tell application "Microsoft Outlook"
-    set m to message {msg_index} of inbox
+    set m to message {msg_index} of {folder_ref}
     set att to attachment {att_index} of m
     save att in POSIX file "{save_path}"
 end tell
@@ -597,6 +646,7 @@ class OutlookClient:
         sender_domains: Optional[List[str]] = None,
         has_attachments: Optional[bool] = None,
         folder: Optional[str] = None,
+        folders: Optional[List[str]] = None,
         is_read: Optional[bool] = None,
         body_contains: Optional[str] = None,
         to_contains: Optional[str] = None,
@@ -619,6 +669,9 @@ class OutlookClient:
             sender_domains: Filter to emails from any of these domains.
             has_attachments: If True, only emails with attachments. If False, only without.
             folder: Folder name to search (default: Inbox). E.g., "Sent Items", "Drafts".
+            folders: List of folder names to search. Scans each folder and merges
+                results sorted by date. E.g., ["Inbox", "Archive", "Snoozed"].
+                If both folder and folders are provided, they are merged.
             is_read: If True, only read emails. If False, only unread.
             body_contains: Case-insensitive substring match on email body.
             to_contains: Case-insensitive substring match on To recipients.
@@ -650,17 +703,39 @@ class OutlookClient:
         if sender_domains:
             all_domains.update(d.lower() for d in sender_domains)
 
+        # Merge folder and folders parameters (like sender_domain/sender_domains)
+        all_folders: Optional[List[str]] = None
+        if folder or folders:
+            folder_set: List[str] = []
+            if folder:
+                folder_set.append(folder)
+            if folders:
+                for f in folders:
+                    if f not in folder_set:
+                        folder_set.append(f)
+            all_folders = folder_set
+
         if self.backend == "win32com":
-            results = self._search_win32(
-                date_from=date_from,
-                date_to=date_to,
-                subject_contains=subject_contains,
-                has_attachments=has_attachments,
-                folder=folder,
-                is_read=is_read,
-                importance=importance,
-                max_results=max_results,
-            )
+            if all_folders and len(all_folders) > 1:
+                results = []
+                for fn in all_folders:
+                    results.extend(self._search_win32(
+                        date_from=date_from, date_to=date_to,
+                        subject_contains=subject_contains,
+                        has_attachments=has_attachments, folder=fn,
+                        is_read=is_read, importance=importance,
+                        max_results=max_results,
+                    ))
+                results.sort(key=lambda e: e["received_datetime"], reverse=True)
+            else:
+                results = self._search_win32(
+                    date_from=date_from, date_to=date_to,
+                    subject_contains=subject_contains,
+                    has_attachments=has_attachments,
+                    folder=all_folders[0] if all_folders else None,
+                    is_read=is_read, importance=importance,
+                    max_results=max_results,
+                )
         elif self.backend == "applescript":
             results = self._search_applescript(
                 date_from=date_from,
@@ -668,19 +743,30 @@ class OutlookClient:
                 has_attachments=has_attachments,
                 sender_domains=all_domains if all_domains else None,
                 max_results=max_results,
+                folder=all_folders[0] if all_folders and len(all_folders) == 1 else None,
+                folders=all_folders if all_folders and len(all_folders) > 1 else None,
             )
         else:
-            results = self._search_graph(
-                date_from=date_from,
-                date_to=date_to,
-                subject_contains=subject_contains,
-                has_attachments=has_attachments,
-                folder=folder,
-                is_read=is_read,
-                body_contains=body_contains,
-                importance=importance,
-                max_results=max_results,
-            )
+            if all_folders and len(all_folders) > 1:
+                results = []
+                for fn in all_folders:
+                    results.extend(self._search_graph(
+                        date_from=date_from, date_to=date_to,
+                        subject_contains=subject_contains,
+                        has_attachments=has_attachments, folder=fn,
+                        is_read=is_read, body_contains=body_contains,
+                        importance=importance, max_results=max_results,
+                    ))
+                results.sort(key=lambda e: e["received_datetime"], reverse=True)
+            else:
+                results = self._search_graph(
+                    date_from=date_from, date_to=date_to,
+                    subject_contains=subject_contains,
+                    has_attachments=has_attachments,
+                    folder=all_folders[0] if all_folders else None,
+                    is_read=is_read, body_contains=body_contains,
+                    importance=importance, max_results=max_results,
+                )
 
         # Apply post-filters that both backends handle uniformly in Python
         results = self._apply_post_filters(
@@ -802,30 +888,51 @@ class OutlookClient:
 
     def _search_applescript(
         self, date_from, date_to, has_attachments, sender_domains, max_results,
+        folder=None, folders=None,
     ) -> List[Dict]:
         """Search emails via AppleScript/JXA (Outlook for Mac Legacy)."""
         start = date_from or datetime(2000, 1, 1)
         end = date_to or datetime.now()
         domain_list = list(sender_domains) if sender_domains else None
 
-        return self._applescript.scan_emails(
-            start_date=start,
-            end_date=end,
-            sender_domains=domain_list,
-            only_with_attachments=has_attachments,
-            max_results=max_results,
-        )
+        # Build list of folders to scan
+        folder_list: List[Optional[str]] = []
+        if folders:
+            folder_list = list(folders)
+        elif folder:
+            folder_list = [folder]
+        else:
+            folder_list = [None]  # Default: Inbox
+
+        all_results: List[Dict] = []
+        for fn in folder_list:
+            results = self._applescript.scan_emails(
+                start_date=start,
+                end_date=end,
+                sender_domains=domain_list,
+                only_with_attachments=has_attachments,
+                max_results=max_results,
+                folder_name=fn,
+            )
+            all_results.extend(results)
+
+        # Sort by date descending (newest first) when searching multiple folders
+        if len(folder_list) > 1:
+            all_results.sort(key=lambda e: e["received_datetime"], reverse=True)
+
+        return all_results
 
     def _download_applescript(self, email: Dict, attachment: Dict, dest: Path):
         """Download attachment via AppleScript."""
         msg_idx = attachment.get("_as_msg_index")
         att_idx = attachment.get("_as_att_index")
+        folder_name = attachment.get("_as_folder_name")
         if msg_idx is None or att_idx is None:
             raise RuntimeError(
                 f"Attachment missing AppleScript indices: {attachment}. "
                 "Make sure this attachment came from a search() result."
             )
-        self._applescript.save_attachment(msg_idx, att_idx, dest)
+        self._applescript.save_attachment(msg_idx, att_idx, dest, folder_name=folder_name)
 
     def _send_applescript(self, to, subject, body, cc, bcc, attachments, html) -> bool:
         """Send email via AppleScript."""

@@ -43,6 +43,8 @@ def cmd_search(args):
         kwargs["has_attachments"] = True
     if args.folder:
         kwargs["folder"] = args.folder
+    if args.folders:
+        kwargs["folders"] = args.folders
     if args.unread:
         kwargs["is_read"] = False
     if args.read:
@@ -138,6 +140,7 @@ def main():
     sp.add_argument("--domains", nargs="+", help="Multiple sender domains")
     sp.add_argument("--has-attachments", action="store_true", help="Only emails with attachments")
     sp.add_argument("--folder", help="Folder to search (default: Inbox)")
+    sp.add_argument("--folders", nargs="+", help="Multiple folders to search (e.g., Inbox Archive Snoozed)")
     sp.add_argument("--unread", action="store_true", help="Only unread emails")
     sp.add_argument("--read", action="store_true", help="Only read emails")
     sp.add_argument("--body", help="Body contains (case-insensitive)")

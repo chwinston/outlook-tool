@@ -167,6 +167,13 @@ outlook-tool search --unread
 # Find emails with attachments
 outlook-tool search --has-attachments
 
+# Search a specific folder (default is Inbox)
+outlook-tool search --from 2026-03-01 --folder "Sent Items"
+outlook-tool search --from 2026-03-01 --folder Archive
+
+# Search multiple folders at once
+outlook-tool search --from 2026-03-15 --to-date 2026-03-21 --folders Inbox Archive Snoozed
+
 # Combine multiple filters (finds emails matching ALL conditions)
 outlook-tool search --from 2026-03-01 --domain example.com --subject "report" --has-attachments
 
@@ -234,6 +241,13 @@ for email in emails:
     for att in email["attachments"]:
         path = client.download_attachment(email, att, output_dir="./downloads")
         print(f"Saved: {path}")
+
+# Search across multiple folders
+emails = client.search(
+    date_from="2026-03-15",
+    date_to="2026-03-21",
+    folders=["Inbox", "Archive", "Snoozed"],
+)
 
 # Send an email
 client.send(
@@ -324,6 +338,7 @@ Every filter is optional. When you use multiple filters, only emails matching **
 | Multiple domains | `--domains` | `--domains example.com partner.org` |
 | Has attachments | `--has-attachments` | `--has-attachments` |
 | Specific folder | `--folder` | `--folder "Sent Items"` |
+| Multiple folders | `--folders` | `--folders Inbox Archive Snoozed` |
 | Only unread | `--unread` | `--unread` |
 | Only read | `--read` | `--read` |
 | Body text keyword | `--body` | `--body "action required"` |
@@ -354,6 +369,7 @@ Every filter is optional. When you use multiple filters, only emails matching **
 - Double-check your date range — dates are inclusive, format is `YYYY-MM-DD`
 - Make sure Outlook has the emails downloaded/synced (not still loading)
 - Try a broader search first (just `--from` with no other filters) to confirm things work
+- By default, only the **Inbox** folder is searched. If your emails are in Archive, Snoozed, or other folders, use `--folders Inbox Archive Snoozed` to search multiple folders at once
 
 ### Virtual environment issues
 - If `pip install` gives errors, make sure you see `(.venv)` in your terminal prompt
