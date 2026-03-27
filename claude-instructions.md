@@ -164,6 +164,26 @@ client.send(
 
 CLI: `outlook-tool send --to user@example.com --subject "Hi" --body "Hello" --attach file.pdf`
 
+### Calendar events
+
+The `get_events()` method and `outlook-tool events` CLI return calendar events:
+
+```python
+events = client.get_events(date_from="2026-03-27", date_to="2026-03-28")
+for evt in events:
+    print(f"{evt['start_date']} {evt['start_datetime'].strftime('%H:%M')} — {evt['subject']}")
+```
+
+| Filter | Python kwarg | CLI flag |
+|---|---|---|
+| Date range | `date_from=`, `date_to=` | `--from`, `--to-date` |
+| Today only | — | `--today` |
+| This week | — | `--week` |
+| Subject keyword | `subject_contains=` | `--subject` |
+| Max results | `max_results=` | `--max-results` |
+
+CLI: `outlook-tool events --today` or `outlook-tool events --from 2026-03-27 --to-date 2026-03-28 --json`
+
 ### Email dict structure
 
 Every email from `search()` returns:
@@ -204,7 +224,7 @@ Every email from `search()` returns:
 pytest tests/ -v
 ```
 
-43+ unit tests covering helpers, post-filters, platform detection, and input validation. Tests do not require Outlook — they mock the backends.
+59 unit tests covering helpers, post-filters, platform detection, client initialization, calendar events, path traversal prevention, OData sanitization, and JXA parsing. Tests do not require Outlook — they mock the backends.
 
 ## Key Design Decisions
 
