@@ -2,7 +2,7 @@
 
 ## Bolt 3 — Security Hardening & Code Quality (Staff Panel + Security Audit)
 
-**Status:** IN PROGRESS
+**Status:** COMPLETE
 **Goal:** Fix all P0/P1/P2 findings from the combined staff panel review and security audit.
 **Opened:** 2026-03-27
 **Branch:** bolt/20260327-security-quality-sweep
