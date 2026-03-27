@@ -15,12 +15,45 @@ import pytest
 import sys
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
-from outlook_tool import OutlookClient, _parse_date, _extract_domain
+from outlook_tool import OutlookClient, _parse_date, _extract_domain, _escape_applescript
 
 
 # =============================================================================
 # HELPER TESTS
 # =============================================================================
+
+class TestEscapeApplescript:
+    def test_double_quotes_escaped(self):
+        assert _escape_applescript('say "hello"') == 'say \\"hello\\"'
+
+    def test_backslash_escaped(self):
+        assert _escape_applescript("path\\to\\file") == "path\\\\to\\\\file"
+
+    def test_newlines_escaped(self):
+        assert _escape_applescript("line1\nline2") == "line1\\nline2"
+
+    def test_carriage_return_escaped(self):
+        assert _escape_applescript("a\rb") == "a\\rb"
+
+    def test_tab_escaped(self):
+        assert _escape_applescript("col1\tcol2") == "col1\\tcol2"
+
+    def test_combined_special_chars(self):
+        result = _escape_applescript('He said "hi"\npath\\x')
+        assert result == 'He said \\"hi\\"\\npath\\\\x'
+
+    def test_plain_string_unchanged(self):
+        assert _escape_applescript("hello world") == "hello world"
+
+    def test_empty_string(self):
+        assert _escape_applescript("") == ""
+
+    def test_injection_attempt(self):
+        # Simulates an attacker trying to break out of a quoted string
+        malicious = '" & do shell script "rm -rf /" & "'
+        result = _escape_applescript(malicious)
+        assert '"' not in result.replace('\\"', '')  # no unescaped quotes
+
 
 class TestParseDate:
     def test_iso_format(self):

@@ -46,6 +46,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import quote as _url_quote
 
 # =============================================================================
 # PLATFORM DETECTION
@@ -67,11 +68,16 @@ if not HAS_WIN32 and sys.platform == "darwin":
     import shutil
     HAS_APPLESCRIPT = shutil.which("osascript") is not None
 
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None  # type: ignore[assignment]
+
 if not HAS_WIN32 and not HAS_APPLESCRIPT:
     try:
         import msal
-        import requests as _requests
-        HAS_GRAPH = True
+        if _requests is not None:
+            HAS_GRAPH = True
     except ImportError:
         HAS_GRAPH = False
 
@@ -82,6 +88,20 @@ if not HAS_WIN32 and not HAS_APPLESCRIPT:
 
 import json
 import subprocess
+
+
+def _escape_applescript(s: str) -> str:
+    """Escape a string for safe interpolation into AppleScript double-quoted strings.
+
+    Handles backslashes, double quotes, newlines, carriage returns, and tabs
+    to prevent command injection via crafted email addresses, subjects, or paths.
+    """
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"', '\\"')
+    s = s.replace("\n", "\\n")
+    s = s.replace("\r", "\\r")
+    s = s.replace("\t", "\\t")
+    return s
 
 
 def _run_jxa(script: str, timeout: int = 120) -> str:
@@ -167,7 +187,7 @@ class _AppleScriptBackend:
 
                     var recvMs = recvDate.getTime();
 
-                    if (recvMs < startMs) break;
+                    if (recvMs < startMs) continue;
                     if (recvMs >= endMs) continue;
 
                     scanned++;
@@ -296,7 +316,7 @@ class _AppleScriptBackend:
     def save_attachment(self, msg_index: int, att_index: int, output_path: Path) -> bool:
         """Save an attachment to disk via AppleScript."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        save_path = str(output_path.resolve())
+        save_path = _escape_applescript(str(output_path.resolve()))
 
         script = f'''
 tell application "Microsoft Outlook"
@@ -320,32 +340,31 @@ end tell
     ) -> bool:
         """Send an email via AppleScript."""
         to_lines = "\n".join(
-            f'        make new to recipient at end of to recipients with properties {{email address:{{address:"{addr}"}}}}'
+            f'        make new to recipient at end of to recipients with properties {{email address:{{address:"{_escape_applescript(addr)}"}}}}'
             for addr in to
         )
         cc_lines = ""
         if cc:
             cc_lines = "\n".join(
-                f'        make new cc recipient at end of cc recipients with properties {{email address:{{address:"{addr}"}}}}'
+                f'        make new cc recipient at end of cc recipients with properties {{email address:{{address:"{_escape_applescript(addr)}"}}}}'
                 for addr in cc
             )
         bcc_lines = ""
         if bcc:
             bcc_lines = "\n".join(
-                f'        make new bcc recipient at end of bcc recipients with properties {{email address:{{address:"{addr}"}}}}'
+                f'        make new bcc recipient at end of bcc recipients with properties {{email address:{{address:"{_escape_applescript(addr)}"}}}}'
                 for addr in bcc
             )
 
-        # Escape special characters for AppleScript
-        safe_subject = subject.replace("\\", "\\\\").replace('"', '\\"')
-        safe_body = body.replace("\\", "\\\\").replace('"', '\\"')
+        safe_subject = _escape_applescript(subject)
+        safe_body = _escape_applescript(body)
 
         content_prop = "content" if html else "plain text content"
 
         att_lines = ""
         if attachments:
             att_lines = "\n".join(
-                f'        make new attachment at end of attachments with properties {{file:POSIX file "{str(p.resolve())}"}}'
+                f'        make new attachment at end of attachments with properties {{file:POSIX file "{_escape_applescript(str(p.resolve()))}"}}'
                 for p in attachments
             )
 
@@ -424,6 +443,7 @@ class _GraphBackend:
     def _save_cache(self):
         if self._cache.has_state_changed:
             self.token_cache_path.write_text(self._cache.serialize())
+            os.chmod(self.token_cache_path, 0o600)
 
     def _acquire_token(self) -> str:
         accounts = self._app.get_accounts()
@@ -472,7 +492,7 @@ class _GraphBackend:
         resp.raise_for_status()
         return resp.json()
 
-    def _api_post(self, url: str, json_body: dict) -> _requests.Response:
+    def _api_post(self, url: str, json_body: dict):
         resp = _requests.post(url, headers=self._headers(), json=json_body)
         if resp.status_code == 401:
             self._token = None
@@ -1046,7 +1066,7 @@ class OutlookClient:
 
         # Determine folder endpoint
         if folder and folder.lower() != "inbox":
-            folder_segment = f"mailFolders('{folder}')/messages"
+            folder_segment = f"mailFolders('{_url_quote(folder, safe='')}')/messages"
         else:
             folder_segment = "messages"
 
@@ -1061,12 +1081,15 @@ class OutlookClient:
             params["$filter"] = filter_str
 
         all_messages = []
-        while url and len(all_messages) < max_results:
+        max_pages = 10
+        page = 0
+        while url and len(all_messages) < max_results and page < max_pages:
             data = self._graph._api_get(url, params)
             messages = data.get("value", [])
             all_messages.extend(messages)
             url = data.get("@odata.nextLink")
             params = None
+            page += 1
 
         results = []
         for msg in all_messages[:max_results]:

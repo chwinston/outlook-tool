@@ -1,5 +1,4 @@
 # Outlook Tool Dependencies
-openpyxl>=3.1.0              # Excel file handling (for attachment inspection)
 msal>=1.28.0                 # Microsoft Graph API auth (Mac/Linux)
 requests>=2.31.0             # HTTP client for Graph API (Mac/Linux)
 pywin32>=306; sys_platform == "win32"  # Outlook COM automation (Windows-only)
