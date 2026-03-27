@@ -2,7 +2,7 @@
 
 ## Bolt 2 — DLC Hardening + Calendar Support
 
-**Status:** IN PROGRESS
+**Status:** COMPLETE
 **Goal:** Close DLC audit gaps (D2, D5, D8 improvements), then add calendar event search to all 3 backends with CLI and Python API support.
 **Opened:** 2026-03-27
 **Branch:** bolt/20260327-dlc-hardening-calendar-support
