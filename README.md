@@ -57,14 +57,15 @@ This tool talks **directly to your Outlook desktop app** — no cloud API keys, 
    ```
    You should see `(.venv)` appear at the start of your terminal prompt.
 
-7. **Install dependencies:**
+7. **Install the tool:**
    ```
-   pip install -r requirements.txt
+   pip install -e .
    ```
+   This installs the tool so you can use it from any folder on your computer (not just the outlook-tool folder).
 
 8. **Verify it works:**
    ```
-   python cli.py search --from 2026-03-01 --to-date 2026-03-26 --max-results 5
+   outlook-tool search --from 2026-03-01 --to-date 2026-03-26 --max-results 5
    ```
    You should see your 5 most recent emails from that date range printed out.
 
@@ -109,14 +110,15 @@ That's it — you're ready to go.
    source .venv/bin/activate
    ```
 
-7. **Install dependencies:**
+7. **Install the tool:**
    ```
-   pip install -r requirements.txt
+   pip install -e .
    ```
+   This installs the tool so you can use it from any folder on your computer (not just the outlook-tool folder).
 
 8. **Verify it works:**
    ```
-   python3 cli.py search --from 2026-03-01 --to-date 2026-03-26 --max-results 5
+   outlook-tool search --from 2026-03-01 --to-date 2026-03-26 --max-results 5
    ```
 
 9. **If macOS asks for permission** to control Outlook, click **Allow**. This is a one-time prompt.
@@ -125,21 +127,19 @@ That's it — you're ready to go.
 
 ## Daily Usage
 
-Every time you open a new terminal to use the tool, you need to activate the virtual environment first:
+Every time you open a new terminal to use the tool, you need to activate the virtual environment first. You do **not** need to be in the outlook-tool folder — activate from wherever you are:
 
 **Windows:**
 ```
-cd C:\Users\YourName\Projects\outlook-tool
-.venv\Scripts\activate
+C:\Users\YourName\Projects\outlook-tool\.venv\Scripts\activate
 ```
 
 **Mac:**
 ```
-cd ~/Projects/outlook-tool
-source .venv/bin/activate
+source ~/Projects/outlook-tool/.venv/bin/activate
 ```
 
-You'll know it's active when you see `(.venv)` at the start of your terminal line.
+You'll know it's active when you see `(.venv)` at the start of your terminal line. Once active, `outlook-tool` and `from outlook_tool import ...` work from any folder.
 
 ---
 
@@ -149,39 +149,39 @@ You'll know it's active when you see `(.venv)` at the start of your terminal lin
 
 ```bash
 # Find emails from the last week
-python cli.py search --from 2026-03-19 --to-date 2026-03-26
+outlook-tool search --from 2026-03-19 --to-date 2026-03-26
 
 # Find emails from a specific person
-python cli.py search --sender-name "Jane Smith"
-python cli.py search --sender-email jane.smith@example.com
+outlook-tool search --sender-name "Jane Smith"
+outlook-tool search --sender-email jane.smith@example.com
 
 # Find emails from a specific company
-python cli.py search --domain example.com
+outlook-tool search --domain example.com
 
 # Find emails with a keyword in the subject
-python cli.py search --subject "quarterly report"
+outlook-tool search --subject "quarterly report"
 
 # Find only unread emails
-python cli.py search --unread
+outlook-tool search --unread
 
 # Find emails with attachments
-python cli.py search --has-attachments
+outlook-tool search --has-attachments
 
 # Combine multiple filters (finds emails matching ALL conditions)
-python cli.py search --from 2026-03-01 --domain example.com --subject "report" --has-attachments
+outlook-tool search --from 2026-03-01 --domain example.com --subject "report" --has-attachments
 
 # Limit how many results you get (default is 50)
-python cli.py search --from 2026-01-01 --max-results 10
+outlook-tool search --from 2026-01-01 --max-results 10
 
 # Get results as raw JSON (useful for piping to other tools)
-python cli.py search --from 2026-03-01 --json
+outlook-tool search --from 2026-03-01 --json
 ```
 
 ### Download Attachments
 
 ```bash
 # Search and download all attachments to a folder
-python cli.py search --sender-email boss@example.com --has-attachments --download ./my-downloads
+outlook-tool search --sender-email boss@example.com --has-attachments --download ./my-downloads
 ```
 
 This creates a `my-downloads` folder and saves all attachments from matching emails into it.
@@ -190,19 +190,19 @@ This creates a `my-downloads` folder and saves all attachments from matching ema
 
 ```bash
 # Send a simple email
-python cli.py send --to colleague@example.com --subject "Hello" --body "Just checking in."
+outlook-tool send --to colleague@example.com --subject "Hello" --body "Just checking in."
 
 # Send to multiple people
-python cli.py send --to user1@example.com user2@example.com --subject "Team update" --body "See below."
+outlook-tool send --to user1@example.com user2@example.com --subject "Team update" --body "See below."
 
 # Send with CC
-python cli.py send --to user@example.com --cc manager@example.com --subject "FYI" --body "Sharing this."
+outlook-tool send --to user@example.com --cc manager@example.com --subject "FYI" --body "Sharing this."
 
 # Send with file attachments
-python cli.py send --to user@example.com --subject "Report" --body "Attached." --attach report.pdf data.xlsx
+outlook-tool send --to user@example.com --subject "Report" --body "Attached." --attach report.pdf data.xlsx
 
 # Send a high-importance email
-python cli.py send --to user@example.com --subject "Urgent" --body "Please review ASAP" --importance high
+outlook-tool send --to user@example.com --subject "Urgent" --body "Please review ASAP" --importance high
 ```
 
 ---
@@ -252,6 +252,59 @@ client.send(
     importance="high",
 )
 ```
+
+---
+
+## Using From Other Projects / Folders
+
+You do **not** need to be inside the `outlook-tool` folder to use this tool. After running `pip install -e .` during setup, the tool is available from anywhere — as long as you've activated the virtual environment.
+
+### From the command line (any folder)
+
+```bash
+# First, activate the venv (one-time per terminal session)
+# Windows:
+C:\Users\YourName\Projects\outlook-tool\.venv\Scripts\activate
+
+# Mac:
+source ~/Projects/outlook-tool/.venv/bin/activate
+
+# Now use it from wherever you are
+cd C:\Users\YourName\Projects\some-other-project
+outlook-tool search --from 2026-03-01 --subject "report"
+```
+
+### From Python scripts (any folder)
+
+```python
+# This works in any .py file, as long as the outlook-tool venv is active
+from outlook_tool import OutlookClient
+
+client = OutlookClient()
+emails = client.search(sender_domain="example.com")
+```
+
+### Making it truly global (no venv activation needed)
+
+If you want `outlook-tool` available without activating any virtual environment:
+
+```bash
+# Windows (run from any terminal):
+pip install -e C:\Users\YourName\Projects\outlook-tool
+
+# Mac:
+pip install -e ~/Projects/outlook-tool
+```
+
+This installs into your system Python so it's always available. The trade-off is that it's harder to manage updates — the virtual environment approach is recommended for most users.
+
+### Summary
+
+| Install method | Need to be in outlook-tool folder? | Need to activate venv? |
+|---|---|---|
+| `pip install -e .` (recommended) | No | Yes, once per terminal session |
+| `pip install -e /path/to/outlook-tool` | No | No |
+| `pip install -r requirements.txt` only | Yes (must use `python cli.py`) | Yes |
 
 ---
 
