@@ -235,3 +235,4 @@ pytest tests/ -v
 - **`backend=` kwarg** — advanced users can force a specific backend: `OutlookClient(backend="graph")`.
 - **Multi-folder search** — `folders=["Inbox", "Archive", "Snoozed"]` searches multiple folders and merges results sorted by date. Follows the same pattern as `sender_domain`/`sender_domains`. Attachment downloads are folder-aware (tracked via `_as_folder_name`).
 - **Calendar support** — `get_events()` method and `outlook-tool events` CLI command for searching calendar events by date range across all three backends.
+- **Summary ledger** — `outlook-tool summary` merges emails + calendar events into a chronological timeline with stable anchor IDs (E001, C001) for cross-linking from narrative documents. Outputs JSON (default) or markdown. Supports `--folders`, `--no-calendar`, `--output FILE`.

@@ -162,6 +162,136 @@ def cmd_events(args):
     return results
 
 
+def cmd_summary(args):
+    """Generate a structured chronological ledger of emails and calendar events."""
+    client = OutlookClient()
+
+    date_from = args.date_from or datetime.now().strftime("%Y-%m-%d")
+    date_to = args.date_to or date_from
+
+    # Fetch emails
+    email_kwargs = {"date_from": date_from, "date_to": date_to, "max_results": 500}
+    if args.folders:
+        email_kwargs["folders"] = args.folders
+
+    emails = client.search(**email_kwargs)
+
+    # Fetch calendar events (unless --no-calendar)
+    events = []
+    if not args.no_calendar:
+        events = client.get_events(date_from=date_from, date_to=date_to, max_results=200)
+
+    # Build unified timeline
+    entries = []
+    for e in emails:
+        entries.append({
+            "kind": "email",
+            "id": e.get("id", ""),
+            "datetime": e["received_datetime"],
+            "date": e["received_date"],
+            "time": e["received_datetime"].strftime("%I:%M %p"),
+            "day": e["received_datetime"].strftime("%a %b %d"),
+            "subject": e["subject"],
+            "from_name": e["sender_name"],
+            "from_email": e["sender_email"],
+            "to": e.get("to", ""),
+            "folder": next(
+                (a["_as_folder_name"] for a in e.get("attachments", []) if "_as_folder_name" in a),
+                "Inbox",
+            ),
+            "has_attachments": e["has_attachments"],
+            "body_preview": e.get("body_preview", "")[:500],
+        })
+
+    for ev in events:
+        entries.append({
+            "kind": "event",
+            "id": ev.get("id", ""),
+            "datetime": ev["start_datetime"],
+            "date": ev["start_date"],
+            "time": ev["start_datetime"].strftime("%I:%M %p"),
+            "end_time": ev["end_datetime"].strftime("%I:%M %p"),
+            "day": ev["start_datetime"].strftime("%a %b %d"),
+            "subject": ev["subject"],
+            "from_name": ev.get("organizer_name", ""),
+            "from_email": ev.get("organizer_email", ""),
+            "location": ev.get("location", ""),
+            "is_all_day": ev.get("is_all_day", False),
+            "status": ev.get("status", ""),
+            "attendees": ev.get("attendees", []),
+            "body_preview": ev.get("body_preview", "")[:500],
+        })
+
+    # Sort chronologically
+    entries.sort(key=lambda x: x["datetime"])
+
+    # Assign display IDs
+    email_idx = 0
+    event_idx = 0
+    for entry in entries:
+        if entry["kind"] == "email":
+            email_idx += 1
+            entry["display_id"] = f"E{email_idx:03d}"
+        else:
+            event_idx += 1
+            entry["display_id"] = f"C{event_idx:03d}"
+
+    # Output
+    if args.format == "json":
+        serializable = []
+        for entry in entries:
+            row = {k: v for k, v in entry.items() if k != "datetime"}
+            row["datetime"] = entry["datetime"].isoformat()
+            serializable.append(row)
+        output = json.dumps({
+            "schema_version": 1,
+            "date_from": date_from,
+            "date_to": date_to,
+            "email_count": email_idx,
+            "event_count": event_idx,
+            "entries": serializable,
+        }, indent=2)
+    else:
+        # Markdown ledger
+        lines = [
+            f"# Chronological Ledger: {date_from} to {date_to}",
+            "",
+            f"**Emails:** {email_idx} | **Calendar events:** {event_idx} | **Total:** {len(entries)}",
+            "",
+            "---",
+            "",
+            "| ID | Type | Date | Time | From | Subject |",
+            "|----|------|------|------|------|---------|",
+        ]
+        for entry in entries:
+            eid = entry["display_id"]
+            kind = entry["kind"]
+            day = entry["day"]
+            time = entry["time"]
+            if kind == "event" and entry.get("is_all_day"):
+                time = "All day"
+            elif kind == "event":
+                time = f"{time}–{entry.get('end_time', '')}"
+            from_name = entry["from_name"] or entry.get("from_email", "")
+            subject = entry["subject"][:80]
+            icon = "📧" if kind == "email" else "📅"
+            lines.append(
+                f"| <a id=\"{eid}\"></a>{eid} | {icon} | {day} | {time} | {from_name} | {subject} |"
+            )
+        lines.append("")
+        output = "\n".join(lines)
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(output)
+        print(f"Summary written to {out_path}", file=sys.stderr)
+    else:
+        print(output)
+
+    return entries
+
+
 def cmd_send(args):
     """Send an email."""
     client = OutlookClient()
@@ -228,6 +358,16 @@ def main():
     sp.add_argument("--body", dest="show_body", action="store_true", help="Show meeting notes/description")
     sp.add_argument("--json", action="store_true", help="Output results as JSON")
     sp.set_defaults(func=cmd_events)
+
+    # ---- summary ----
+    sp = subparsers.add_parser("summary", help="Generate chronological ledger of emails and events")
+    sp.add_argument("--from", dest="date_from", help="Start date (YYYY-MM-DD, default: today)")
+    sp.add_argument("--to-date", dest="date_to", help="End date (YYYY-MM-DD, default: same as --from)")
+    sp.add_argument("--folders", nargs="+", help="Email folders to search (default: Inbox)")
+    sp.add_argument("--no-calendar", action="store_true", help="Exclude calendar events")
+    sp.add_argument("--format", choices=["json", "markdown"], default="json", help="Output format (default: json)")
+    sp.add_argument("--output", metavar="FILE", help="Write to file instead of stdout")
+    sp.set_defaults(func=cmd_summary)
 
     # ---- send ----
     sp = subparsers.add_parser("send", help="Send an email")

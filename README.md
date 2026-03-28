@@ -225,6 +225,27 @@ outlook-tool events --from 2026-03-27 --json
 
 Each event shows the date, time range (or "All day"), location, subject, organizer, and attendees with their response status (accepted, tentative, declined). Use `--body` to also display the meeting description/notes.
 
+### Generate Summary Ledger
+
+```bash
+# Generate a chronological ledger of today's emails + calendar events (JSON)
+outlook-tool summary --from 2026-03-27
+
+# Ledger for a date range as markdown (with anchor IDs for cross-linking)
+outlook-tool summary --from 2026-03-15 --to-date 2026-03-21 --format markdown
+
+# Search multiple email folders
+outlook-tool summary --from 2026-03-15 --to-date 2026-03-21 --folders Inbox Archive Snoozed
+
+# Emails only, no calendar events
+outlook-tool summary --from 2026-03-15 --to-date 2026-03-21 --no-calendar
+
+# Write to a file
+outlook-tool summary --from 2026-03-15 --to-date 2026-03-21 --format markdown --output weekly-ledger.md
+```
+
+The summary command merges emails and calendar events into a single chronological timeline. Each entry gets a stable display ID (`E001` for emails, `C001` for calendar events) with HTML anchor tags for cross-linking from narrative documents.
+
 ### Send Emails
 
 ```bash
