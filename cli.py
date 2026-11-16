@@ -15,7 +15,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from outlook_tool import OutlookClient
+from outlook_tool import OperationResult, OutlookClient
 
 
 def cmd_search(args):
@@ -292,6 +292,151 @@ def cmd_summary(args):
     return entries
 
 
+def _print_result(result: OperationResult, as_json: bool) -> None:
+    """Render an OperationResult as JSON or a one-line human summary."""
+    if as_json:
+        print(json.dumps(result.to_dict(), indent=2, default=str))
+        return
+    marker = {
+        "success": "OK",
+        "failed": "FAIL",
+        "unsupported": "UNSUPPORTED",
+        "dry_run": "DRY-RUN",
+    }.get(result.status, result.status)
+    verified = "verified" if result.verified else "UNVERIFIED"
+    detail = f" — {result.error_detail}" if result.error_detail else ""
+    elapsed = f" ({result.elapsed_ms} ms)" if result.elapsed_ms is not None else ""
+    print(
+        f"[{marker}] {result.operation} msg={result.message_id} "
+        f"backend={result.backend} ({verified}){elapsed}{detail}"
+    )
+    if result.before_state:
+        print(f"  before: {json.dumps(result.before_state, default=str)}")
+    if result.after_state:
+        print(f"  after:  {json.dumps(result.after_state, default=str)}")
+
+
+def _dry_run_result(operation: str, message_id: str, plan: dict) -> OperationResult:
+    """Build a DRY-RUN OperationResult used when --apply is not set."""
+    return OperationResult(
+        status="dry_run",
+        operation=operation,
+        message_id=message_id,
+        before_state={"plan": plan},
+        backend="cli",
+    )
+
+
+def _exit_code_from(result: OperationResult) -> int:
+    """CLI exit code policy: success/dry_run → 0, unsupported → 2, failed → 1."""
+    if result.status in ("success", "dry_run"):
+        return 0
+    if result.status == "unsupported":
+        return 2
+    return 1
+
+
+def cmd_move(args):
+    """Move a message to ``target_folder``. Dry-run by default; --apply to fire."""
+    plan = {
+        "operation": "move",
+        "message_id": args.message_id,
+        "target_folder": args.target_folder,
+        "source_folder": args.source_folder,
+    }
+    if not args.apply:
+        result = _dry_run_result("move", args.message_id, plan)
+        print(
+            f"DRY RUN: would move message {args.message_id} to folder "
+            f"{args.target_folder!r} (source={args.source_folder or 'Inbox'}). "
+            f"Re-run with --apply to execute.",
+            file=sys.stderr,
+        )
+        _print_result(result, args.json)
+        return _exit_code_from(result)
+
+    client = OutlookClient()
+    result = client.move(
+        args.message_id,
+        args.target_folder,
+        source_folder=args.source_folder,
+    )
+    _print_result(result, args.json)
+    return _exit_code_from(result)
+
+
+def cmd_delete(args):
+    """Delete a message. Soft-delete by default; --permanent needs --yes-really-permanent."""
+    plan = {
+        "operation": "delete",
+        "message_id": args.message_id,
+        "permanent": args.permanent,
+        "folder_name": args.folder,
+    }
+    if args.permanent and not args.yes_really_permanent:
+        print(
+            "REFUSED: --permanent requires --yes-really-permanent in the "
+            "same invocation. Soft-delete (default) is almost always what "
+            "you want.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not args.apply:
+        kind = "HARD DELETE" if args.permanent else "SOFT DELETE"
+        print(
+            f"DRY RUN: would {kind} message {args.message_id} "
+            f"(folder={args.folder or 'Inbox'}). Re-run with --apply to execute.",
+            file=sys.stderr,
+        )
+        result = _dry_run_result("delete", args.message_id, plan)
+        _print_result(result, args.json)
+        return _exit_code_from(result)
+
+    client = OutlookClient()
+    try:
+        result = client.delete(
+            args.message_id,
+            permanent=args.permanent,
+            yes_really_permanent=args.yes_really_permanent,
+            folder_name=args.folder,
+        )
+    except ValueError as e:
+        # Belt-and-suspenders: client re-asserts the double-flag invariant.
+        print(f"REFUSED: {e}", file=sys.stderr)
+        return 2
+    _print_result(result, args.json)
+    return _exit_code_from(result)
+
+
+def cmd_mark_read(args):
+    """Mark a message read (default) or unread."""
+    read = not args.unread  # default: mark as read
+    plan = {
+        "operation": "mark_read",
+        "message_id": args.message_id,
+        "read": read,
+        "folder_name": args.folder,
+    }
+    if not args.apply:
+        verb = "mark READ" if read else "mark UNREAD"
+        print(
+            f"DRY RUN: would {verb} message {args.message_id} "
+            f"(folder={args.folder or 'Inbox'}). Re-run with --apply to execute.",
+            file=sys.stderr,
+        )
+        result = _dry_run_result("mark_read", args.message_id, plan)
+        _print_result(result, args.json)
+        return _exit_code_from(result)
+
+    client = OutlookClient()
+    result = client.mark_read(
+        args.message_id, read=read, folder_name=args.folder,
+    )
+    _print_result(result, args.json)
+    return _exit_code_from(result)
+
+
 def cmd_send(args):
     """Send an email."""
     client = OutlookClient()
@@ -369,6 +514,49 @@ def main():
     sp.add_argument("--output", metavar="FILE", help="Write to file instead of stdout")
     sp.set_defaults(func=cmd_summary)
 
+    # ---- move ----
+    sp = subparsers.add_parser(
+        "move",
+        help="Move a message to a folder (dry-run default; --apply to execute)",
+    )
+    sp.add_argument("message_id", help="Backend-scoped message id (e.g. 'as_msg_7' or an Outlook EntryID)")
+    sp.add_argument("target_folder", help="Destination folder (created if missing on AppleScript/COM)")
+    sp.add_argument("--source-folder", help="Source folder for AppleScript (default: Inbox)")
+    sp.add_argument("--apply", action="store_true", help="Actually perform the move (otherwise dry-run)")
+    sp.add_argument("--json", action="store_true", help="Emit the OperationResult as JSON")
+    sp.set_defaults(func=cmd_move)
+
+    # ---- delete ----
+    sp = subparsers.add_parser(
+        "delete",
+        help="Delete a message — soft-delete default; --permanent + --yes-really-permanent for hard-delete",
+    )
+    sp.add_argument("message_id", help="Backend-scoped message id")
+    sp.add_argument("--folder", help="Source folder for AppleScript (default: Inbox)")
+    sp.add_argument(
+        "--permanent", action="store_true",
+        help="Hard-delete (bypass Deleted Items). Requires --yes-really-permanent.",
+    )
+    sp.add_argument(
+        "--yes-really-permanent", action="store_true",
+        help="Required alongside --permanent — the belt to the braces.",
+    )
+    sp.add_argument("--apply", action="store_true", help="Actually perform the delete (otherwise dry-run)")
+    sp.add_argument("--json", action="store_true", help="Emit the OperationResult as JSON")
+    sp.set_defaults(func=cmd_delete)
+
+    # ---- mark-read ----
+    sp = subparsers.add_parser(
+        "mark-read",
+        help="Mark a message as read (default) or unread (--unread). Dry-run default; --apply to execute.",
+    )
+    sp.add_argument("message_id", help="Backend-scoped message id")
+    sp.add_argument("--folder", help="Folder for AppleScript (default: Inbox)")
+    sp.add_argument("--unread", action="store_true", help="Mark as unread instead of read")
+    sp.add_argument("--apply", action="store_true", help="Actually perform the write (otherwise dry-run)")
+    sp.add_argument("--json", action="store_true", help="Emit the OperationResult as JSON")
+    sp.set_defaults(func=cmd_mark_read)
+
     # ---- send ----
     sp = subparsers.add_parser("send", help="Send an email")
     sp.add_argument("--to", nargs="+", required=True, help="Recipient(s)")
@@ -382,7 +570,9 @@ def main():
     sp.set_defaults(func=cmd_send)
 
     args = parser.parse_args()
-    args.func(args)
+    result = args.func(args)
+    if isinstance(result, int):
+        sys.exit(result)
 
 
 if __name__ == "__main__":
