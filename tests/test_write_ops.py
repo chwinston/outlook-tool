@@ -647,6 +647,110 @@ class TestGraphDelete:
 
 
 # =============================================================================
+# OutlookClient dispatch tests (yes_really_permanent, backend routing)
+# =============================================================================
+
+class TestOutlookClientDispatch:
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_mark_read_routes_to_win32(self):
+        c = OutlookClient()
+        with patch.object(
+            c, "_mark_read_win32",
+            return_value=OperationResult(status="success", operation="mark_read",
+                                         message_id="eid", backend="win32com"),
+        ) as m:
+            r = c.mark_read("eid", read=False)
+        m.assert_called_once_with("eid", read=False)
+        assert r.status == "success"
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_move_routes_to_win32(self):
+        c = OutlookClient()
+        with patch.object(
+            c, "_move_win32",
+            return_value=OperationResult(status="success", operation="move",
+                                         message_id="new_eid", backend="win32com"),
+        ) as m:
+            c.move("eid", "Archive")
+        m.assert_called_once_with("eid", "Archive")
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_delete_default_is_soft(self):
+        c = OutlookClient()
+        with patch.object(
+            c, "_delete_win32",
+            return_value=OperationResult(status="success", operation="delete",
+                                         message_id="eid", backend="win32com"),
+        ) as m:
+            c.delete("eid")
+        m.assert_called_once_with("eid", permanent=False)
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_delete_permanent_requires_double_flag(self):
+        c = OutlookClient()
+        with pytest.raises(ValueError, match="yes_really_permanent"):
+            c.delete("eid", permanent=True)  # missing yes_really_permanent
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_delete_permanent_with_double_flag_proceeds(self):
+        c = OutlookClient()
+        with patch.object(
+            c, "_delete_win32",
+            return_value=OperationResult(status="success", operation="delete",
+                                         message_id="eid", backend="win32com"),
+        ) as m:
+            c.delete("eid", permanent=True, yes_really_permanent=True)
+        m.assert_called_once_with("eid", permanent=True)
+
+    @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool.HAS_APPLESCRIPT", True)
+    @patch("outlook_tool._AppleScriptBackend")
+    def test_mark_read_routes_to_applescript_with_parsed_index(self, mock_as_cls):
+        mock_backend = MagicMock()
+        mock_backend.mark_read.return_value = OperationResult(
+            status="success", operation="mark_read",
+            message_id="as_msg_7", backend="applescript",
+        )
+        mock_as_cls.return_value = mock_backend
+        c = OutlookClient()
+        c.mark_read("as_msg_7", read=True, folder_name="Inbox")
+        mock_backend.mark_read.assert_called_once_with(
+            msg_index=7, folder_name="Inbox", read=True,
+        )
+
+    @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool.HAS_APPLESCRIPT", True)
+    @patch("outlook_tool._AppleScriptBackend")
+    def test_move_routes_to_applescript_with_source_folder(self, mock_as_cls):
+        mock_backend = MagicMock()
+        mock_backend.move.return_value = OperationResult(
+            status="success", operation="move",
+            message_id="as_msg_3", backend="applescript",
+        )
+        mock_as_cls.return_value = mock_backend
+        c = OutlookClient()
+        c.move("as_msg_3", "Archive", source_folder="Inbox")
+        mock_backend.move.assert_called_once_with(
+            msg_index=3, target_folder="Archive", source_folder="Inbox",
+        )
+
+
+class TestParseAsMsgIndex:
+    def test_strips_prefix(self):
+        from outlook_tool import _parse_as_msg_index
+        assert _parse_as_msg_index("as_msg_42") == 42
+
+    def test_bare_numeric_ok(self):
+        from outlook_tool import _parse_as_msg_index
+        assert _parse_as_msg_index("7") == 7
+
+    def test_rejects_junk(self):
+        from outlook_tool import _parse_as_msg_index
+        with pytest.raises(ValueError, match="numeric string"):
+            _parse_as_msg_index("win32_abcd")
+
+
+# =============================================================================
 # Shared integration marker — gated by presence of the fixture
 # =============================================================================
 

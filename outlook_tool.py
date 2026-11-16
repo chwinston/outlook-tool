@@ -1491,6 +1491,134 @@ class OutlookClient:
         self._win32_msg_cache: Dict[str, Any] = {}
 
     # -------------------------------------------------------------------------
+    # WRITE VERBS (Bolt 4) — move / delete / mark_read
+    # -------------------------------------------------------------------------
+    #
+    # Thin dispatch methods. Each returns an :class:`OperationResult`. The
+    # backend-specific interpretation of ``message_id`` matters:
+    #
+    # * AppleScript: ``"as_msg_<N>"`` style — the numeric index inside
+    #   ``source_folder`` (or Inbox). Session-scoped — callers that persist
+    #   ids across time must refresh via ``search()``. The optional
+    #   ``source_folder`` / ``folder_name`` kwargs below carry the needed
+    #   folder context.
+    # * COM: the Outlook ``EntryID`` string. Valid across sessions but
+    #   invalidated on move (we rewrite to the moved item's new EntryID in
+    #   the returned OperationResult).
+    # * Graph: the Graph message id. Stable across sessions.
+
+    def move(
+        self,
+        message_id: str,
+        target_folder: str,
+        *,
+        source_folder: Optional[str] = None,
+    ) -> OperationResult:
+        """Move a message to ``target_folder``.
+
+        Args:
+            message_id: Backend-scoped message identifier (see class notes).
+            target_folder: Destination folder name. Will be created if the
+                active backend supports detect-and-create (AppleScript/COM).
+            source_folder: (AppleScript only) Folder the message lives in.
+                Defaults to Inbox. Ignored for COM and Graph where the
+                message_id is self-locating.
+
+        Returns:
+            :class:`OperationResult` with ``verified=True`` only after a
+            round-trip confirms the message landed in ``target_folder``.
+        """
+        if self.backend == "applescript":
+            idx = _parse_as_msg_index(message_id)
+            return self._applescript.move(
+                msg_index=idx,
+                target_folder=target_folder,
+                source_folder=source_folder,
+            )
+        if self.backend == "win32com":
+            return self._move_win32(message_id, target_folder)
+        if self.backend == "graph":
+            return self._move_graph(message_id, target_folder)
+        raise RuntimeError(f"Unknown backend: {self.backend}")
+
+    def delete(
+        self,
+        message_id: str,
+        *,
+        permanent: bool = False,
+        yes_really_permanent: bool = False,
+        folder_name: Optional[str] = None,
+    ) -> OperationResult:
+        """Delete a message — soft-delete (move to Deleted Items) by default.
+
+        Args:
+            message_id: Backend-scoped message identifier.
+            permanent: If True, bypass Deleted Items and hard-delete the
+                message. MUST be paired with ``yes_really_permanent=True`` —
+                otherwise this method raises ``ValueError``. The double-flag
+                is per-call on purpose (panel F6, unanimous): no amount of
+                ``--yes`` global flag survives surviving an operator slip.
+            yes_really_permanent: Explicit acknowledgement that hard-delete
+                is intentional. Only consulted when ``permanent=True``.
+            folder_name: (AppleScript only) Source folder — defaults to Inbox.
+
+        Returns:
+            :class:`OperationResult` with ``after_state["permanent"]``
+            reflecting which path ran.
+        """
+        if permanent and not yes_really_permanent:
+            raise ValueError(
+                "Refusing to hard-delete: permanent=True requires "
+                "yes_really_permanent=True to be set in the same call. "
+                "This double-flag is intentional — soft-delete (default) "
+                "is almost always what you want."
+            )
+        if self.backend == "applescript":
+            idx = _parse_as_msg_index(message_id)
+            return self._applescript.delete_message(
+                msg_index=idx,
+                folder_name=folder_name,
+                permanent=permanent,
+            )
+        if self.backend == "win32com":
+            return self._delete_win32(message_id, permanent=permanent)
+        if self.backend == "graph":
+            return self._delete_graph(message_id, permanent=permanent)
+        raise RuntimeError(f"Unknown backend: {self.backend}")
+
+    def mark_read(
+        self,
+        message_id: str,
+        *,
+        read: bool = True,
+        folder_name: Optional[str] = None,
+    ) -> OperationResult:
+        """Set the read/unread flag on a message.
+
+        Args:
+            message_id: Backend-scoped message identifier.
+            read: True to mark read, False to mark unread.
+            folder_name: (AppleScript only) Folder the message lives in.
+                Defaults to Inbox.
+
+        Returns:
+            :class:`OperationResult` with ``verified=True`` only when a
+            re-fetch confirms ``after_state["is_read"] == read``.
+        """
+        if self.backend == "applescript":
+            idx = _parse_as_msg_index(message_id)
+            return self._applescript.mark_read(
+                msg_index=idx,
+                folder_name=folder_name,
+                read=read,
+            )
+        if self.backend == "win32com":
+            return self._mark_read_win32(message_id, read=read)
+        if self.backend == "graph":
+            return self._mark_read_graph(message_id, read=read)
+        raise RuntimeError(f"Unknown backend: {self.backend}")
+
+    # -------------------------------------------------------------------------
     # SEARCH
     # -------------------------------------------------------------------------
 
@@ -2823,3 +2951,21 @@ def _extract_domain(email_addr: str) -> str:
     if "@" in email_addr:
         return email_addr.split("@")[-1].lower()
     return ""
+
+
+def _parse_as_msg_index(message_id: str) -> int:
+    """Parse the ``as_msg_<N>`` form used by the AppleScript backend.
+
+    Accepts both ``"as_msg_42"`` (as returned by ``search()``) and a bare
+    numeric string ``"42"``. Raises ``ValueError`` on anything else.
+    """
+    s = str(message_id).strip()
+    if s.startswith("as_msg_"):
+        s = s[len("as_msg_"):]
+    try:
+        return int(s)
+    except ValueError:
+        raise ValueError(
+            f"AppleScript message_id must be of the form 'as_msg_<N>' or a "
+            f"numeric string; got {message_id!r}"
+        )
