@@ -265,6 +265,36 @@ outlook-tool send --to user@example.com --subject "Report" --body "Attached." --
 outlook-tool send --to user@example.com --subject "Urgent" --body "Please review ASAP" --importance high
 ```
 
+### Write Verbs — Move / Delete / Mark Read
+
+New in Bolt 4: three write verbs for triaging your inbox. **Every verb is dry-run by default.** You have to pass `--apply` for the mailbox to change.
+
+```bash
+# DRY-RUN by default — prints "DRY RUN: would move message ... to folder Archive"
+outlook-tool move as_msg_7 Archive
+
+# --apply to actually do it
+outlook-tool move as_msg_7 Archive --apply
+
+# Soft-delete (into Deleted Items) — reversible
+outlook-tool delete as_msg_7 --apply
+
+# Hard-delete — requires BOTH --permanent AND --yes-really-permanent
+# Omitting either one exits 2 with REFUSED.
+outlook-tool delete as_msg_7 --permanent --yes-really-permanent --apply
+
+# Mark read / unread
+outlook-tool mark-read as_msg_7 --apply
+outlook-tool mark-read as_msg_7 --unread --apply
+
+# JSON output (useful for the /inbox-triage workflow)
+outlook-tool move as_msg_7 Archive --apply --json
+```
+
+Each verb returns an `OperationResult` with `verified=True` only when a post-op re-fetch confirms the state change. If the op looked like it succeeded but the message didn't move, you'll see `status=failed` with `error_detail` flagging the silent-success. Trust `verified`, not the shell exit code alone.
+
+The Graph backend returns `status=unsupported` for write ops unless your OAuth grant has `Mail.ReadWrite`. On Mac (AppleScript) and Windows (COM) the write verbs work with no extra setup.
+
 ---
 
 ## Python Script Examples
@@ -333,6 +363,29 @@ client.send(
     cc="stakeholder@example.com",
     importance="high",
 )
+
+# Write verbs (Bolt 4): move, delete, mark_read
+# Each returns an OperationResult with a verified-round-trip boolean.
+inbox = client.search(date_from="2026-11-01")
+for email in inbox:
+    # Soft-delete anything from this noisy mailing list
+    if "noreply@noisy-list.com" in email["sender_email"]:
+        result = client.delete(email["id"], folder_name="Inbox")
+        if result.verified:
+            print(f"Deleted: {email['subject']}")
+        else:
+            print(f"FAILED to delete: {email['subject']} — {result.error_detail}")
+    # Mark important ones as read
+    elif "ACTION NEEDED" in email["subject"]:
+        client.mark_read(email["id"], read=True, folder_name="Inbox")
+
+# Hard-delete requires the double-flag — the API will raise ValueError
+# if you try to pass permanent=True without yes_really_permanent=True.
+client.delete(email["id"], permanent=True, yes_really_permanent=True,
+              folder_name="Inbox")
+
+# Move a message between folders (Archive is created if missing on Mac/Win)
+client.move(email["id"], "Archive", source_folder="Inbox")
 ```
 
 ---
