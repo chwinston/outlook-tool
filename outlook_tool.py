@@ -1249,6 +1249,7 @@ end tell
 GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPES_READ = ["Mail.Read"]
 GRAPH_SCOPES_SEND = ["Mail.Read", "Mail.Send"]
+GRAPH_SCOPES_READWRITE = ["Mail.ReadWrite"]
 TOKEN_CACHE_PATH = Path.home() / ".outlook_tool_token_cache.bin"
 
 # Microsoft Office desktop app — public client ID, no registration needed.
@@ -1393,6 +1394,31 @@ class _GraphBackend:
                 authority=f"https://login.microsoftonline.com/{self.tenant_id}",
                 token_cache=self._cache,
             )
+
+    # ------------------------------------------------------------------
+    # Granted-scope detection (Bolt 4)
+    # ------------------------------------------------------------------
+    #
+    # CRITICAL: Phase 1 does not auto-upgrade write scopes. The scope cliff
+    # is surfaced as status="unsupported" so callers know the backend
+    # literally cannot do the write — distinct from a 403 at runtime where
+    # the scope is granted but a specific operation was refused.
+
+    def has_write_scope(self) -> bool:
+        """Return True iff the current client's scopes include Mail.ReadWrite.
+
+        We consult ``self.scopes`` (which reflects the scopes the caller
+        intended to request + any explicit ``upgrade_scopes`` calls) rather
+        than cracking the access token. That keeps the check cheap and
+        avoids pulling a JWT library in just for this.
+
+        Mail.ReadWrite implies Mail.Read and Mail.Send on the Graph
+        permission model, so any of ``Mail.ReadWrite`` or ``Mail.ReadWrite.All``
+        counts as "can write."
+        """
+        write_markers = {"mail.readwrite", "mail.readwrite.all"}
+        normalized = {str(s).lower() for s in (self.scopes or [])}
+        return bool(write_markers & normalized)
 
 
 # =============================================================================
@@ -2488,6 +2514,168 @@ class OutlookClient:
         url = f"{GRAPH_API_BASE}/me/sendMail"
         self._graph._api_post(url, {"message": message})
         return True
+
+    # =========================================================================
+    # GRAPH WRITE OPERATIONS (Bolt 4) — scope-gated
+    # =========================================================================
+    #
+    # Phase 1 does NOT auto-upgrade to Mail.ReadWrite. If the current token
+    # lacks that scope we return status="unsupported" so callers see the
+    # scope cliff instead of a runtime 403. If the scope IS granted and the
+    # API returns 403, we surface a failed status with the 403 detail —
+    # scope-missing and permission-denied are NEVER conflated (panel F2).
+
+    _UNSUPPORTED_DETAIL = (
+        "OAuth grant lacks Mail.ReadWrite — use COM/AppleScript backend, "
+        "or request a scope upgrade and construct OutlookClient with "
+        "scopes=['Mail.ReadWrite']"
+    )
+
+    def _graph_unsupported(self, operation: str, message_id: Optional[str],
+                           elapsed_ms: int) -> OperationResult:
+        return OperationResult(
+            status="unsupported",
+            operation=operation,
+            message_id=message_id,
+            error_detail=self._UNSUPPORTED_DETAIL,
+            backend="graph",
+            elapsed_ms=elapsed_ms,
+        )
+
+    def _graph_write_request(
+        self, method: str, url: str, operation: str, message_id: str,
+        start_ms: float, json_body: Optional[Dict[str, Any]] = None,
+    ) -> OperationResult:
+        """Issue a write request against Graph and translate the response.
+
+        Returns ``OperationResult`` — caller does not need to try/except. On
+        4xx we distinguish scope-missing (should never happen past the
+        has_write_scope check, but defence in depth) from 403 permission
+        denied.
+        """
+        try:
+            kwargs: Dict[str, Any] = {}
+            if json_body is not None:
+                kwargs["json"] = json_body
+            resp = self._graph._api_request(method, url, **kwargs)
+        except Exception as e:
+            # requests.HTTPError on 4xx; our _api_request calls raise_for_status.
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            body_text = ""
+            try:
+                body_text = e.response.text  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            if status_code == 403:
+                return OperationResult(
+                    status="failed", operation=operation, message_id=message_id,
+                    error_detail=f"HTTP 403 (permission denied): {body_text or e!s}",
+                    backend="graph",
+                    elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                )
+            if status_code == 401:
+                return OperationResult(
+                    status="failed", operation=operation, message_id=message_id,
+                    error_detail=f"HTTP 401 (auth failed): {body_text or e!s}",
+                    backend="graph",
+                    elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                )
+            return OperationResult(
+                status="failed", operation=operation, message_id=message_id,
+                error_detail=f"Graph request error: {e}",
+                backend="graph",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        return OperationResult(
+            status="success", operation=operation, message_id=message_id,
+            verified=True,  # Graph returns 2xx only when it actually applied
+            backend="graph",
+            after_state={"http_status": resp.status_code},
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _mark_read_graph(
+        self, message_id: str, read: bool = True,
+    ) -> OperationResult:
+        """Mark a Graph message as read/unread.
+
+        Returns status="unsupported" unless the current token has Mail.ReadWrite.
+        """
+        start_ms = _time_module.perf_counter()
+        operation = "mark_read"
+        if not self._graph.has_write_scope():
+            return self._graph_unsupported(
+                operation, message_id,
+                int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        msg_id_quoted = _url_quote(str(message_id), safe="")
+        url = f"{GRAPH_API_BASE}/me/messages/{msg_id_quoted}"
+        return self._graph_write_request(
+            "patch", url, operation, message_id, start_ms,
+            json_body={"isRead": bool(read)},
+        )
+
+    def _move_graph(
+        self, message_id: str, target_folder: str,
+    ) -> OperationResult:
+        """Move a Graph message to ``target_folder`` (well-known name or ID).
+
+        Returns status="unsupported" unless the current token has Mail.ReadWrite.
+        """
+        start_ms = _time_module.perf_counter()
+        operation = "move"
+        if not self._graph.has_write_scope():
+            return self._graph_unsupported(
+                operation, message_id,
+                int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        if not target_folder:
+            return OperationResult(
+                status="failed", operation=operation, message_id=message_id,
+                error_detail="target_folder must be a non-empty folder name",
+                backend="graph",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        msg_id_quoted = _url_quote(str(message_id), safe="")
+        url = f"{GRAPH_API_BASE}/me/messages/{msg_id_quoted}/move"
+        return self._graph_write_request(
+            "post", url, operation, message_id, start_ms,
+            json_body={"destinationId": target_folder},
+        )
+
+    def _delete_graph(
+        self, message_id: str, permanent: bool = False,
+    ) -> OperationResult:
+        """Delete a Graph message (soft-delete via move to deleteditems by default).
+
+        Returns status="unsupported" unless the current token has Mail.ReadWrite.
+        """
+        start_ms = _time_module.perf_counter()
+        operation = "delete"
+        if not self._graph.has_write_scope():
+            return self._graph_unsupported(
+                operation, message_id,
+                int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        msg_id_quoted = _url_quote(str(message_id), safe="")
+        if not permanent:
+            # Soft-delete = move to deleteditems well-known folder.
+            url = f"{GRAPH_API_BASE}/me/messages/{msg_id_quoted}/move"
+            result = self._graph_write_request(
+                "post", url, operation, message_id, start_ms,
+                json_body={"destinationId": "deleteditems"},
+            )
+            if result.status == "success":
+                result.after_state = {**result.after_state, "permanent": False}
+            return result
+        # Hard delete.
+        url = f"{GRAPH_API_BASE}/me/messages/{msg_id_quoted}"
+        result = self._graph_write_request(
+            "delete", url, operation, message_id, start_ms,
+        )
+        if result.status == "success":
+            result.after_state = {**result.after_state, "permanent": True, "folder": None}
+        return result
 
     def _get_events_graph(self, date_from, date_to, max_results) -> List[Dict]:
         """Get calendar events via Microsoft Graph API."""

@@ -515,6 +515,138 @@ class TestCOMDelete:
 
 
 # =============================================================================
+# Graph backend write ops — scope-gated, mocked HTTP
+# =============================================================================
+
+def _make_graph_client(scopes):
+    """Build an OutlookClient with a stubbed _GraphBackend so no network fires."""
+    client = OutlookClient.__new__(OutlookClient)
+    client.backend = "graph"
+    client._graph = MagicMock()
+    client._graph.scopes = scopes
+    # Delegate has_write_scope to the real impl for realism.
+    from outlook_tool import _GraphBackend
+    client._graph.has_write_scope = lambda: _GraphBackend.has_write_scope(client._graph)
+    client._applescript = None
+    client._win32_msg_cache = {}
+    return client
+
+
+class TestGraphScopeDetection:
+    def test_read_only_scopes_cannot_write(self):
+        c = _make_graph_client(["Mail.Read"])
+        r = c._mark_read_graph("msgid", read=True)
+        assert r.status == "unsupported"
+        assert "Mail.ReadWrite" in r.error_detail
+        assert r.backend == "graph"
+
+    def test_mail_send_alone_still_cannot_write(self):
+        c = _make_graph_client(["Mail.Read", "Mail.Send"])
+        r = c._move_graph("msgid", "Archive")
+        assert r.status == "unsupported"
+
+    def test_mail_readwrite_granted_proceeds(self):
+        c = _make_graph_client(["Mail.ReadWrite"])
+        fake_resp = MagicMock(status_code=200)
+        c._graph._api_request = MagicMock(return_value=fake_resp)
+        r = c._mark_read_graph("msgid", read=True)
+        assert r.status == "success"
+        assert r.backend == "graph"
+        assert r.verified is True
+
+    def test_mail_readwrite_all_also_granted(self):
+        c = _make_graph_client(["Mail.ReadWrite.All"])
+        fake_resp = MagicMock(status_code=200)
+        c._graph._api_request = MagicMock(return_value=fake_resp)
+        r = c._mark_read_graph("msgid", read=True)
+        assert r.status == "success"
+
+
+class TestGraph403VsScopeMissing:
+    """Panel F2 — scope-missing and 403 permission-denied must not be conflated."""
+
+    def test_403_with_write_scope_is_failed_not_unsupported(self):
+        c = _make_graph_client(["Mail.ReadWrite"])
+
+        class FakeResp:
+            status_code = 403
+            text = '{"error":{"code":"ErrorAccessDenied"}}'
+
+        class HTTPErrorLike(Exception):
+            def __init__(self, resp):
+                self.response = resp
+
+        c._graph._api_request = MagicMock(
+            side_effect=HTTPErrorLike(FakeResp()),
+        )
+        r = c._mark_read_graph("msgid", read=True)
+        assert r.status == "failed"  # NOT unsupported
+        assert "403" in r.error_detail
+        assert "permission denied" in r.error_detail.lower()
+
+    def test_401_surfaces_as_failed(self):
+        c = _make_graph_client(["Mail.ReadWrite"])
+
+        class FakeResp:
+            status_code = 401
+            text = "token expired"
+
+        class HTTPErrorLike(Exception):
+            def __init__(self, resp):
+                self.response = resp
+
+        c._graph._api_request = MagicMock(
+            side_effect=HTTPErrorLike(FakeResp()),
+        )
+        r = c._move_graph("msgid", "Archive")
+        assert r.status == "failed"
+        assert "401" in r.error_detail
+
+
+class TestGraphMove:
+    def test_move_calls_graph_move_endpoint(self):
+        c = _make_graph_client(["Mail.ReadWrite"])
+        fake_resp = MagicMock(status_code=201)
+        c._graph._api_request = MagicMock(return_value=fake_resp)
+        r = c._move_graph("mid", "archive")
+        assert r.status == "success"
+        call_args = c._graph._api_request.call_args
+        assert call_args[0][0] == "post"
+        assert "/messages/mid/move" in call_args[0][1]
+        assert call_args[1]["json"] == {"destinationId": "archive"}
+
+    def test_move_empty_target_rejected(self):
+        c = _make_graph_client(["Mail.ReadWrite"])
+        r = c._move_graph("mid", "")
+        assert r.status == "failed"
+        assert "target_folder" in r.error_detail
+
+
+class TestGraphDelete:
+    def test_soft_delete_uses_move_endpoint_with_deleteditems(self):
+        c = _make_graph_client(["Mail.ReadWrite"])
+        fake_resp = MagicMock(status_code=201)
+        c._graph._api_request = MagicMock(return_value=fake_resp)
+        r = c._delete_graph("mid", permanent=False)
+        assert r.status == "success"
+        call = c._graph._api_request.call_args
+        assert "/messages/mid/move" in call[0][1]
+        assert call[1]["json"] == {"destinationId": "deleteditems"}
+        assert r.after_state["permanent"] is False
+
+    def test_hard_delete_uses_delete_verb(self):
+        c = _make_graph_client(["Mail.ReadWrite"])
+        fake_resp = MagicMock(status_code=204)
+        c._graph._api_request = MagicMock(return_value=fake_resp)
+        r = c._delete_graph("mid", permanent=True)
+        assert r.status == "success"
+        call = c._graph._api_request.call_args
+        assert call[0][0] == "delete"
+        assert "/messages/mid" in call[0][1] and "/move" not in call[0][1]
+        assert r.after_state["permanent"] is True
+
+
+# =============================================================================
 # Shared integration marker — gated by presence of the fixture
 # =============================================================================
 
