@@ -44,10 +44,86 @@ import hashlib
 import os
 import re
 import sys
+import time as _time_module
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote as _url_quote
+
+
+# =============================================================================
+# OPERATION RESULT (Bolt 4 — write verbs contract)
+# =============================================================================
+
+@dataclass
+class OperationResult:
+    """Unified return contract for write operations across every backend.
+
+    Produced by :meth:`OutlookClient.move`, :meth:`OutlookClient.delete`,
+    :meth:`OutlookClient.mark_read` and the backend implementations they
+    dispatch to.
+
+    Fields
+    ------
+    status:
+        One of ``"success"``, ``"failed"``, ``"unsupported"``, ``"dry_run"``.
+        ``success`` means the op was attempted and returned without an error;
+        callers MUST also check ``verified`` before trusting the state change.
+        ``unsupported`` is reserved for cases the backend cannot execute —
+        e.g. Graph without ``Mail.ReadWrite`` scope.
+    verified:
+        ``True`` only when a post-op re-fetch confirms the target state.
+        This defends against the AppleScript silent-success failure mode where
+        the op returns no error but Outlook refused the change (Tim F1).
+    message_id:
+        Backend-scoped identifier of the message that was operated on.
+    operation:
+        The verb executed: ``"move"``, ``"delete"`` or ``"mark_read"``.
+    before_state:
+        Snapshot of the salient fields before the op (e.g. ``{"folder": "Inbox",
+        "is_read": False}``). Used to verify no-op safety and for audit logs.
+    after_state:
+        Snapshot of the salient fields after the op, when the backend could
+        re-fetch successfully.
+    error_detail:
+        Human-readable detail when ``status`` is ``failed`` or ``unsupported``.
+    backend:
+        Which backend handled the op — ``"applescript"``, ``"win32com"`` or
+        ``"graph"`` — so callers can reason about provenance.
+    elapsed_ms:
+        Wall-clock duration of the call in milliseconds. Useful for the
+        batching decision Phase 3 will make later.
+    """
+
+    status: str  # "success" | "failed" | "unsupported" | "dry_run"
+    operation: str  # "move" | "delete" | "mark_read"
+    message_id: Optional[str] = None
+    verified: bool = False
+    before_state: Dict[str, Any] = field(default_factory=dict)
+    after_state: Dict[str, Any] = field(default_factory=dict)
+    error_detail: Optional[str] = None
+    backend: Optional[str] = None
+    elapsed_ms: Optional[int] = None
+
+    _VALID_STATUSES = frozenset({"success", "failed", "unsupported", "dry_run"})
+    _VALID_OPERATIONS = frozenset({"move", "delete", "mark_read"})
+
+    def __post_init__(self) -> None:
+        if self.status not in self._VALID_STATUSES:
+            raise ValueError(
+                f"Invalid OperationResult.status={self.status!r}; "
+                f"must be one of {sorted(self._VALID_STATUSES)}"
+            )
+        if self.operation not in self._VALID_OPERATIONS:
+            raise ValueError(
+                f"Invalid OperationResult.operation={self.operation!r}; "
+                f"must be one of {sorted(self._VALID_OPERATIONS)}"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to a plain dict (JSON-safe for CLI output)."""
+        return asdict(self)
 
 # =============================================================================
 # PLATFORM DETECTION

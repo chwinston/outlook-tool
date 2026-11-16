@@ -22,3 +22,9 @@ outlook-tool = "cli:main"
 
 [tool.setuptools]
 py-modules = ["outlook_tool", "cli"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that hit real Outlook (Mac AppleScript or Windows COM). Skipped by default in CI; opt in with `-m integration`.",
+]
+addopts = "-m 'not integration'"
