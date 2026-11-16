@@ -365,6 +365,156 @@ class TestAppleScriptWriteOpsIntegration:
 
 
 # =============================================================================
+# COM backend write ops — mocked unit tests (win32com unavailable on Mac)
+# =============================================================================
+
+from unittest.mock import MagicMock  # noqa: E402
+
+
+class TestCOMMarkRead:
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_mark_read_success(self):
+        client = OutlookClient()
+        msg_before = MagicMock(Subject="Hi", SenderEmailAddress="a@b.com",
+                               UnRead=True, EntryID="eid1")
+        msg_before.Parent.Name = "Inbox"
+        msg_after = MagicMock(Subject="Hi", SenderEmailAddress="a@b.com",
+                              UnRead=False, EntryID="eid1")
+        msg_after.Parent.Name = "Inbox"
+        with patch.object(
+            client, "_get_win32_message_by_entry_id",
+            side_effect=[msg_before, msg_after],
+        ):
+            r = client._mark_read_win32("eid1", read=True)
+        assert r.status == "success"
+        assert r.verified is True
+        assert r.backend == "win32com"
+        assert r.before_state["is_read"] is False
+        assert r.after_state["is_read"] is True
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_mark_read_silent_success_detected(self):
+        """Simulate Outlook silently refusing the write — before and after both
+        report unread even though we wrote UnRead=False."""
+        client = OutlookClient()
+        msg_before = MagicMock(Subject="Hi", SenderEmailAddress="a@b.com",
+                               UnRead=True, EntryID="eid1")
+        msg_before.Parent.Name = "Inbox"
+        # The post-write re-fetch returns a *fresh* mock whose UnRead is still True.
+        msg_after = MagicMock(Subject="Hi", SenderEmailAddress="a@b.com",
+                              UnRead=True, EntryID="eid1")
+        msg_after.Parent.Name = "Inbox"
+        with patch.object(
+            client, "_get_win32_message_by_entry_id",
+            side_effect=[msg_before, msg_after],
+        ):
+            r = client._mark_read_win32("eid1", read=True)
+        assert r.status == "failed"
+        assert r.verified is False
+
+
+class TestCOMMove:
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_move_captures_returned_item(self):
+        """COM Move() invalidates the original handle — we must use what it returns."""
+        client = OutlookClient()
+        original = MagicMock(Subject="S", SenderEmailAddress="s@x.com",
+                             UnRead=False, EntryID="old_eid")
+        original.Parent.Name = "Inbox"
+        moved = MagicMock(Subject="S", SenderEmailAddress="s@x.com",
+                          UnRead=False, EntryID="new_eid")
+        moved.Parent.Name = "Archive"
+        original.Move.return_value = moved
+        target_folder = MagicMock(Name="Archive")
+
+        with patch.object(client, "_get_win32_message_by_entry_id",
+                          return_value=original), \
+             patch.object(client, "_resolve_win32_folder",
+                          return_value=target_folder):
+            r = client._move_win32("old_eid", "Archive")
+        original.Move.assert_called_once_with(target_folder)
+        assert r.status == "success"
+        assert r.verified is True
+        # EntryID is rewritten to the moved item's.
+        assert r.message_id == "new_eid"
+        assert r.after_state["folder"] == "Archive"
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_move_returns_none_is_failure(self):
+        client = OutlookClient()
+        original = MagicMock(Subject="S", SenderEmailAddress="s@x.com",
+                             UnRead=False, EntryID="eid")
+        original.Parent.Name = "Inbox"
+        original.Move.return_value = None
+        target_folder = MagicMock(Name="Archive")
+        with patch.object(client, "_get_win32_message_by_entry_id",
+                          return_value=original), \
+             patch.object(client, "_resolve_win32_folder",
+                          return_value=target_folder):
+            r = client._move_win32("eid", "Archive")
+        assert r.status == "failed"
+        assert "returned None" in r.error_detail
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_move_empty_folder_rejected(self):
+        client = OutlookClient()
+        r = client._move_win32("eid", "")
+        assert r.status == "failed"
+        assert "target_folder" in r.error_detail
+
+
+class TestCOMDelete:
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_soft_delete_goes_through_move(self):
+        client = OutlookClient()
+        with patch.object(
+            client, "_move_win32",
+            return_value=OperationResult(
+                status="success", operation="move", message_id="new_eid",
+                verified=True,
+                before_state={"folder": "Inbox"},
+                after_state={"folder": "Deleted Items"},
+                backend="win32com", elapsed_ms=3,
+            ),
+        ) as mv:
+            r = client._delete_win32("old_eid", permanent=False)
+        mv.assert_called_once_with("old_eid", "Deleted Items")
+        assert r.status == "success"
+        assert r.operation == "delete"
+        assert r.after_state["permanent"] is False
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_hard_delete_verifies_entry_id_gone(self):
+        client = OutlookClient()
+        msg = MagicMock(Subject="X", SenderEmailAddress="x@y.com",
+                        UnRead=False, EntryID="eid")
+        msg.Parent.Name = "Inbox"
+        with patch.object(
+            client, "_get_win32_message_by_entry_id",
+            side_effect=[msg, Exception("not found")],
+        ):
+            r = client._delete_win32("eid", permanent=True)
+        msg.Delete.assert_called_once()
+        assert r.status == "success"
+        assert r.verified is True
+        assert r.after_state["permanent"] is True
+
+    @patch("outlook_tool.HAS_WIN32", True)
+    def test_hard_delete_silent_success_when_entry_still_resolves(self):
+        client = OutlookClient()
+        msg = MagicMock(Subject="X", SenderEmailAddress="x@y.com",
+                        UnRead=False, EntryID="eid")
+        msg.Parent.Name = "Inbox"
+        with patch.object(
+            client, "_get_win32_message_by_entry_id",
+            side_effect=[msg, msg],  # 2nd call still succeeds = silent-success
+        ):
+            r = client._delete_win32("eid", permanent=True)
+        assert r.status == "failed"
+        assert r.verified is False
+
+
+# =============================================================================
 # Shared integration marker — gated by presence of the fixture
 # =============================================================================
 

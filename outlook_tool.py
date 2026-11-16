@@ -2101,6 +2101,233 @@ class OutlookClient:
         return results
 
     # =========================================================================
+    # WIN32COM WRITE OPERATIONS (Bolt 4)
+    # =========================================================================
+    #
+    # CRITICAL: Outlook's MailItem.Move() returns the moved item. After the
+    # call, the ORIGINAL handle (by EntryID in the source store) is invalid
+    # — the message now lives at a different EntryID in the destination
+    # store. We MUST capture the returned item for verify. Never re-query
+    # the old EntryID.
+
+    def _get_win32_message_by_entry_id(self, entry_id: str):
+        """Resolve an Outlook MailItem by EntryID via the MAPI namespace."""
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        return namespace.GetItemFromID(entry_id)
+
+    def _win32_message_snapshot(self, msg) -> Dict[str, Any]:
+        """Return a dict snapshot of the salient fields on a MailItem."""
+        try:
+            parent_name = msg.Parent.Name if msg.Parent is not None else ""
+        except Exception:
+            parent_name = ""
+        return {
+            "folder": parent_name or "Inbox",
+            "is_read": not bool(getattr(msg, "UnRead", False)),
+            "subject": getattr(msg, "Subject", "") or "",
+            "sender_email": getattr(msg, "SenderEmailAddress", "") or "",
+            "entry_id": getattr(msg, "EntryID", "") or "",
+        }
+
+    def _mark_read_win32(
+        self, entry_id: str, read: bool = True,
+    ) -> OperationResult:
+        """Mark a message read/unread via COM and verify."""
+        start_ms = _time_module.perf_counter()
+        operation = "mark_read"
+        try:
+            msg = self._get_win32_message_by_entry_id(entry_id)
+            before = self._win32_message_snapshot(msg)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                error_detail=f"pre-fetch failed: {e}", backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        try:
+            msg.UnRead = not bool(read)
+            msg.Save()
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"COM error during write: {e}",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        # Round-trip verify. EntryID is still valid (mark_read doesn't move).
+        try:
+            msg_refetched = self._get_win32_message_by_entry_id(entry_id)
+            after = self._win32_message_snapshot(msg_refetched)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"post-verify fetch failed: {e}",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        verified = after["is_read"] == bool(read)
+        return OperationResult(
+            status="success" if verified else "failed",
+            operation=operation, message_id=entry_id, verified=verified,
+            before_state=before, after_state=after,
+            error_detail=None if verified else "post-state did not match request",
+            backend="win32com",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _resolve_win32_folder(self, folder_name: str):
+        """Find a target folder by name, creating it if missing on the default store."""
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        # Default folders handled by _get_win32_folder
+        try:
+            return self._get_win32_folder(folder_name)
+        except Exception:
+            pass
+        # Otherwise: ensure a top-level folder on the default store.
+        inbox = namespace.GetDefaultFolder(6)  # olFolderInbox
+        root = inbox.Parent
+        for f in root.Folders:
+            if f.Name.lower() == folder_name.lower():
+                return f
+        # Create it
+        return root.Folders.Add(folder_name)
+
+    def _move_win32(
+        self, entry_id: str, target_folder: str,
+    ) -> OperationResult:
+        """Move a message to ``target_folder`` and verify via the Move() return."""
+        start_ms = _time_module.perf_counter()
+        operation = "move"
+        if not target_folder:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                error_detail="target_folder must be a non-empty folder name",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        try:
+            msg = self._get_win32_message_by_entry_id(entry_id)
+            before = self._win32_message_snapshot(msg)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                error_detail=f"pre-fetch failed: {e}", backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        try:
+            target = self._resolve_win32_folder(target_folder)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"folder resolution failed: {e}",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        # CRITICAL (panel-flagged): capture the returned moved item.
+        try:
+            moved = msg.Move(target)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"COM Move() error: {e}",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        if moved is None:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail="COM Move() returned None (move did not take effect)",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        after = self._win32_message_snapshot(moved)
+        verified = after["folder"].lower() == target_folder.lower() or (
+            # Resolved folder name may be the canonical one (e.g. "Archive" via
+            # a default-folder constant); accept a match on the resolved folder.
+            after["folder"].lower() == getattr(target, "Name", target_folder).lower()
+        )
+        new_entry_id = getattr(moved, "EntryID", None)
+        return OperationResult(
+            status="success" if verified else "failed",
+            operation=operation,
+            # Report the new EntryID — the old one is invalidated.
+            message_id=new_entry_id or entry_id,
+            verified=verified,
+            before_state=before, after_state=after,
+            error_detail=None if verified else (
+                f"post-move verify: moved item's parent={after['folder']!r} "
+                f"not {target_folder!r}"
+            ),
+            backend="win32com",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _delete_win32(
+        self, entry_id: str, permanent: bool = False,
+    ) -> OperationResult:
+        """Delete a message — soft-delete (Deleted Items) by default."""
+        start_ms = _time_module.perf_counter()
+        operation = "delete"
+        if not permanent:
+            # Soft-delete is a Move to Deleted Items — same verify path.
+            move_res = self._move_win32(entry_id, "Deleted Items")
+            return OperationResult(
+                status=move_res.status, operation=operation,
+                message_id=move_res.message_id, verified=move_res.verified,
+                before_state=move_res.before_state,
+                after_state={**move_res.after_state, "permanent": False},
+                error_detail=move_res.error_detail, backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        # Hard delete.
+        try:
+            msg = self._get_win32_message_by_entry_id(entry_id)
+            before = self._win32_message_snapshot(msg)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                error_detail=f"pre-fetch failed: {e}", backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        try:
+            msg.Delete()
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"COM Delete() error: {e}", backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        # Verify absence — refetch by EntryID should raise.
+        try:
+            self._get_win32_message_by_entry_id(entry_id)
+            # If we got here, the message still exists — silent success.
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                verified=False, before_state=before,
+                after_state={"folder": None, "permanent": True},
+                error_detail="post-delete verify: EntryID still resolves",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        except Exception:
+            # Can't refetch — that's what we want.
+            return OperationResult(
+                status="success", operation=operation, message_id=entry_id,
+                verified=True, before_state=before,
+                after_state={"folder": None, "permanent": True},
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+    # =========================================================================
     # GRAPH API IMPLEMENTATION
     # =========================================================================
 
