@@ -655,6 +655,592 @@ end tell
 
         return results
 
+    # =========================================================================
+    # WRITE OPERATIONS (Bolt 4) — mark_read / move / delete
+    # =========================================================================
+    #
+    # Round-trip verify is mandatory on every write. The dominant AppleScript
+    # risk is silent-success (Tim F1): the op returns 0 bytes to stderr but
+    # Outlook didn't actually perform the change. Every public write method
+    # below re-queries the message after the op and sets
+    # ``OperationResult.verified`` only when the observed post-state matches
+    # the intent.
+    #
+    # NOTE FOR PHASE 2: AppleScript message indices are session-scoped. A
+    # triage report produced via ``scan_emails`` and acted on more than a
+    # few minutes later may encounter stale indices (Outlook re-sorted the
+    # folder, user deleted something, etc.). The executor in Phase 2 MUST
+    # refuse reports > 1h old and SHOULD fall back to (sender, subject,
+    # received_date) identity if the raw index misses.
+
+    @staticmethod
+    def _folder_ref(folder_name: Optional[str]) -> str:
+        """Return the AppleScript expression resolving to the right mail folder.
+
+        Inbox is a special-cased convenience; anything else goes through the
+        first exchange account.
+        """
+        if not folder_name or folder_name.lower() == "inbox":
+            return "inbox"
+        safe = _escape_applescript(folder_name)
+        return f'mail folder "{safe}" of (first exchange account)'
+
+    def _fetch_message_state(
+        self, msg_index: int, folder_name: Optional[str]
+    ) -> Dict[str, Any]:
+        """Re-fetch a message's salient state for round-trip verification.
+
+        Returns a dict with ``folder``, ``is_read``, ``subject``, ``sender_email``.
+        Raises ``RuntimeError`` if the message cannot be found in ``folder_name``
+        (used by move/delete verify to confirm the message actually left).
+        """
+        msg_index = int(msg_index)
+        safe_folder = json.dumps(folder_name) if folder_name else "null"
+        script = f"""
+        (function() {{
+            var outlook = Application("Microsoft Outlook");
+            var folderName = {safe_folder};
+            var folder;
+            if (!folderName || folderName.toLowerCase() === "inbox") {{
+                folder = outlook.inbox;
+            }} else {{
+                var accts = outlook.exchangeAccounts();
+                if (accts.length === 0) return JSON.stringify({{error: "no_account"}});
+                var allFolders = accts[0].mailFolders();
+                for (var fi = 0; fi < allFolders.length; fi++) {{
+                    try {{
+                        if (allFolders[fi].name() === folderName) {{
+                            folder = allFolders[fi];
+                            break;
+                        }}
+                    }} catch(e) {{}}
+                }}
+                if (!folder) return JSON.stringify({{error: "folder_not_found"}});
+            }}
+            try {{
+                var m = folder.messages[{msg_index - 1}];
+                var subj = ""; try {{ subj = m.subject() || ""; }} catch(e) {{}}
+                var isRead = false; try {{ isRead = m.isRead(); }} catch(e) {{}}
+                var addr = ""; try {{ addr = m.sender().address || ""; }} catch(e) {{}}
+                return JSON.stringify({{subject: subj, is_read: isRead, sender_email: addr}});
+            }} catch(e) {{
+                return JSON.stringify({{error: "message_not_found"}});
+            }}
+        }})();
+        """
+        raw = _run_jxa(script, timeout=60)
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            raise RuntimeError(f"_fetch_message_state: bad JSON: {e}")
+        if isinstance(data, dict) and "error" in data:
+            raise RuntimeError(
+                f"Message index {msg_index} not resolvable in folder "
+                f"{folder_name or 'Inbox'!r}: {data['error']}"
+            )
+        return {
+            "folder": folder_name or "Inbox",
+            "is_read": bool(data.get("is_read", False)),
+            "subject": data.get("subject", ""),
+            "sender_email": data.get("sender_email", ""),
+        }
+
+    def mark_read(
+        self,
+        msg_index: int,
+        folder_name: Optional[str] = None,
+        read: bool = True,
+    ) -> OperationResult:
+        """Set the read/unread flag on a message and verify.
+
+        Args:
+            msg_index: AppleScript message index inside ``folder_name``.
+                Comes from a ``scan_emails`` result's ``_as_msg_index``.
+            folder_name: Folder the message lives in. ``None``/``"Inbox"``
+                targets the default Inbox.
+            read: ``True`` to mark read, ``False`` to mark unread.
+
+        Returns:
+            ``OperationResult`` with ``verified=True`` iff the post-op state
+            matches the requested ``read`` value.
+        """
+        start_ms = _time_module.perf_counter()
+        msg_index = int(msg_index)
+        folder_ref = self._folder_ref(folder_name)
+        operation = "mark_read"
+        message_id = f"as_msg_{msg_index}"
+
+        try:
+            before = self._fetch_message_state(msg_index, folder_name)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                error_detail=f"pre-fetch failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        target_bool = "true" if read else "false"
+        script = f'''
+tell application "Microsoft Outlook"
+    set m to message {msg_index} of {folder_ref}
+    set read status of m to {target_bool}
+end tell
+'''
+        try:
+            _run_applescript(script)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"applescript error: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Round-trip verify.
+        try:
+            after = self._fetch_message_state(msg_index, folder_name)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"post-verify fetch failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        verified = after["is_read"] == bool(read)
+        return OperationResult(
+            status="success" if verified else "failed",
+            operation=operation,
+            message_id=message_id,
+            verified=verified,
+            before_state=before,
+            after_state=after,
+            error_detail=None if verified else "post-state did not match request (silent success?)",
+            backend="applescript",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _folder_exists(self, folder_name: str) -> bool:
+        """Does a top-level mail folder with this exact name exist?"""
+        safe = _escape_applescript(folder_name)
+        script = f'''
+tell application "Microsoft Outlook"
+    try
+        set f to mail folder "{safe}" of (first exchange account)
+        return "yes"
+    on error
+        return "no"
+    end try
+end tell
+'''
+        return _run_applescript(script).strip() == "yes"
+
+    def ensure_folder(self, folder_name: str) -> None:
+        """Detect-and-create a top-level mail folder on the primary account.
+
+        No-op if the folder already exists. Raises ``RuntimeError`` on failure.
+        """
+        if not folder_name or folder_name.lower() == "inbox":
+            return  # inbox is always present
+        if self._folder_exists(folder_name):
+            return
+        safe = _escape_applescript(folder_name)
+        script = f'''
+tell application "Microsoft Outlook"
+    set acct to first exchange account
+    make new mail folder at acct with properties {{name:"{safe}"}}
+end tell
+'''
+        _run_applescript(script)
+        if not self._folder_exists(folder_name):
+            raise RuntimeError(
+                f"ensure_folder: creation of {folder_name!r} did not take effect"
+            )
+
+    def move(
+        self,
+        msg_index: int,
+        target_folder: str,
+        source_folder: Optional[str] = None,
+    ) -> OperationResult:
+        """Move a message from ``source_folder`` to ``target_folder``.
+
+        Creates ``target_folder`` on the primary Exchange account if it doesn't
+        yet exist (detect-and-create — Al F3). Round-trip verify re-queries the
+        TARGET folder to confirm the message actually arrived (Tim F1 —
+        silent-success defence).
+
+        Note on verification: we re-query the target folder by scanning the last
+        50 messages for a matching ``(subject, sender_email)`` fingerprint. This
+        is more robust than trusting the post-move index would stay valid, since
+        AppleScript indices reorder after a move.
+
+        Args:
+            msg_index: AppleScript index in the source folder.
+            target_folder: Destination folder name. Created if missing.
+            source_folder: Where the message lives now. ``None`` = Inbox.
+
+        Returns:
+            ``OperationResult`` with ``verified=True`` only when a fingerprint
+            match is found in ``target_folder`` within the last 50 messages.
+        """
+        start_ms = _time_module.perf_counter()
+        msg_index = int(msg_index)
+        operation = "move"
+        message_id = f"as_msg_{msg_index}"
+        source_folder = source_folder or "Inbox"
+        src_ref = self._folder_ref(source_folder)
+
+        if not target_folder or target_folder.strip() == "":
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                error_detail="target_folder must be a non-empty folder name",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        try:
+            before = self._fetch_message_state(msg_index, source_folder)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                error_detail=f"pre-fetch failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Detect-and-create target folder (Al F3).
+        try:
+            self.ensure_folder(target_folder)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"ensure_folder({target_folder!r}) failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        safe_target = _escape_applescript(target_folder)
+        script = f'''
+tell application "Microsoft Outlook"
+    set m to message {msg_index} of {src_ref}
+    move m to mail folder "{safe_target}" of (first exchange account)
+end tell
+'''
+        try:
+            _run_applescript(script)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"applescript error: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Round-trip verify by fingerprint in target folder (Tim F1).
+        target_subject = before.get("subject", "")
+        target_sender = before.get("sender_email", "")
+        verified = self._verify_present_in_folder(
+            folder_name=target_folder,
+            subject=target_subject,
+            sender_email=target_sender,
+            scan_limit=50,
+        )
+
+        after: Dict[str, Any] = {
+            "folder": target_folder,
+            "subject": target_subject,
+            "sender_email": target_sender,
+        }
+        return OperationResult(
+            status="success" if verified else "failed",
+            operation=operation,
+            message_id=message_id,
+            verified=verified,
+            before_state=before,
+            after_state=after,
+            error_detail=None if verified else (
+                f"post-move verify did not find message in {target_folder!r} "
+                "(possible silent-success)"
+            ),
+            backend="applescript",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _verify_present_in_folder(
+        self,
+        folder_name: str,
+        subject: str,
+        sender_email: str,
+        scan_limit: int = 50,
+    ) -> bool:
+        """Scan the top ``scan_limit`` messages of ``folder_name`` for a match.
+
+        Returns True if any message's ``(subject, sender_email)`` matches.
+        ``sender_email`` comparison is case-insensitive and tolerates the
+        empty string (some drafts and in-house messages lack a resolvable
+        SMTP sender on AppleScript).
+        """
+        folder_ref = self._folder_ref(folder_name)
+        # Build a JXA-side fetch so we can compare in Python and avoid the
+        # AppleScript/tell-block handler scoping quirks.
+        safe_folder = json.dumps(folder_name)
+        script = f"""
+        (function() {{
+            var outlook = Application("Microsoft Outlook");
+            var folderName = {safe_folder};
+            var folder;
+            if (!folderName || folderName.toLowerCase() === "inbox") {{
+                folder = outlook.inbox;
+            }} else {{
+                var accts = outlook.exchangeAccounts();
+                if (accts.length === 0) return JSON.stringify([]);
+                var allFolders = accts[0].mailFolders();
+                for (var fi = 0; fi < allFolders.length; fi++) {{
+                    try {{
+                        if (allFolders[fi].name() === folderName) {{
+                            folder = allFolders[fi];
+                            break;
+                        }}
+                    }} catch(e) {{}}
+                }}
+                if (!folder) return JSON.stringify([]);
+            }}
+            var msgCount = folder.messages.length;
+            var limit = Math.min(msgCount, {int(scan_limit)});
+            var out = [];
+            for (var i = 0; i < limit; i++) {{
+                try {{
+                    var m = folder.messages[i];
+                    var subj = "";
+                    try {{ subj = m.subject() || ""; }} catch(e) {{}}
+                    var addr = "";
+                    try {{ addr = m.sender().address || ""; }} catch(e) {{}}
+                    out.push({{subject: subj, sender: addr}});
+                }} catch(e) {{}}
+            }}
+            return JSON.stringify(out);
+        }})();
+        """
+        raw = _run_jxa(script, timeout=60)
+        try:
+            entries = json.loads(raw or "[]")
+        except Exception:
+            return False
+        target_subject = subject or ""
+        target_sender = (sender_email or "").lower()
+        for entry in entries:
+            if entry.get("subject", "") != target_subject:
+                continue
+            if not target_sender:
+                return True
+            if (entry.get("sender", "") or "").lower() == target_sender:
+                return True
+        return False
+
+    def delete_message(
+        self,
+        msg_index: int,
+        folder_name: Optional[str] = None,
+        permanent: bool = False,
+    ) -> OperationResult:
+        """Delete a message — soft-delete (move to Deleted Items) by default.
+
+        Args:
+            msg_index: AppleScript index in ``folder_name``.
+            folder_name: Source folder. ``None`` = Inbox.
+            permanent: If True, hard-delete (remove without trash). The
+                public ``OutlookClient.delete`` enforces the extra
+                ``yes_really_permanent`` gate on top of this flag.
+
+        Returns:
+            ``OperationResult``. For soft-delete, verified=True when the
+            message appears in Deleted Items. For hard-delete, verified=True
+            when the message is no longer present in the source folder.
+        """
+        start_ms = _time_module.perf_counter()
+        msg_index = int(msg_index)
+        operation = "delete"
+        message_id = f"as_msg_{msg_index}"
+        source_folder = folder_name or "Inbox"
+
+        if not permanent:
+            # Soft-delete is just a move into Deleted Items. Use the move path
+            # so verification semantics (fingerprint hit in destination) match.
+            result = self.move(
+                msg_index=msg_index,
+                target_folder="Deleted Items",
+                source_folder=source_folder,
+            )
+            # Rewrite op to reflect intent — move internally, delete externally.
+            return OperationResult(
+                status=result.status,
+                operation=operation,
+                message_id=result.message_id,
+                verified=result.verified,
+                before_state=result.before_state,
+                after_state={**result.after_state, "permanent": False},
+                error_detail=result.error_detail,
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Permanent delete path.
+        src_ref = self._folder_ref(source_folder)
+        try:
+            before = self._fetch_message_state(msg_index, source_folder)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                error_detail=f"pre-fetch failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        script = f'''
+tell application "Microsoft Outlook"
+    set m to message {msg_index} of {src_ref}
+    delete m
+end tell
+'''
+        try:
+            _run_applescript(script)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"applescript error: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Verify: message should NOT be present in source folder by fingerprint.
+        still_there = self._verify_present_in_folder(
+            folder_name=source_folder,
+            subject=before.get("subject", ""),
+            sender_email=before.get("sender_email", ""),
+            scan_limit=50,
+        )
+        verified = not still_there
+        return OperationResult(
+            status="success" if verified else "failed",
+            operation=operation,
+            message_id=message_id,
+            verified=verified,
+            before_state=before,
+            after_state={"folder": None, "permanent": True},
+            error_detail=None if verified else (
+                "post-delete verify: message still present in source folder"
+            ),
+            backend="applescript",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    # ------------------------------------------------------------------
+    # Test harness helpers (used by tests/test_write_ops.py only)
+    # ------------------------------------------------------------------
+
+    def delete_folder_if_empty(self, folder_name: str) -> bool:
+        """Delete ``folder_name`` on the primary account iff it is empty.
+
+        Returns True if the folder was deleted, False otherwise. Never raises
+        for a missing folder.
+        """
+        if not folder_name or folder_name.lower() == "inbox":
+            return False
+        if not self._folder_exists(folder_name):
+            return False
+        safe = _escape_applescript(folder_name)
+        script = f'''
+tell application "Microsoft Outlook"
+    set f to mail folder "{safe}" of (first exchange account)
+    if (count of messages of f) is 0 then
+        delete f
+        return "deleted"
+    else
+        return "not_empty"
+    end if
+end tell
+'''
+        return _run_applescript(script).strip() == "deleted"
+
+    def seed_draft_in_folder(
+        self,
+        folder_name: str,
+        subject: str,
+        body: str,
+    ) -> Dict[str, Any]:
+        """Create a draft message directly inside ``folder_name`` and return
+        its state fingerprint + a newly-fetched AppleScript index.
+
+        The draft is created, moved into the folder, and then re-queried so
+        tests get the ``_as_msg_index`` they need to exercise write verbs.
+        """
+        self.ensure_folder(folder_name)
+        safe_subject = _escape_applescript(subject)
+        safe_body = _escape_applescript(body)
+        safe_folder = _escape_applescript(folder_name)
+        script = f'''
+tell application "Microsoft Outlook"
+    set draftMsg to make new outgoing message with properties {{subject:"{safe_subject}", plain text content:"{safe_body}"}}
+    move draftMsg to mail folder "{safe_folder}" of (first exchange account)
+end tell
+'''
+        _run_applescript(script)
+        # Find the just-created message by subject.
+        folder_ref = self._folder_ref(folder_name)
+        find_script = f'''
+tell application "Microsoft Outlook"
+    set f to {folder_ref}
+    set msgCount to count of messages of f
+    set i to 1
+    repeat while i <= msgCount and i <= 50
+        try
+            set m to message i of f
+            if subject of m is equal to "{safe_subject}" then
+                return i as text
+            end if
+        end try
+        set i to i + 1
+    end repeat
+    return "not_found"
+end tell
+'''
+        idx_raw = _run_applescript(find_script).strip()
+        if idx_raw == "not_found":
+            raise RuntimeError(
+                f"seed_draft_in_folder: could not locate seeded message "
+                f"{subject!r} in {folder_name!r}"
+            )
+        return {
+            "msg_index": int(idx_raw),
+            "folder_name": folder_name,
+            "subject": subject,
+        }
+
 
 # =============================================================================
 # GRAPH API BACKEND
