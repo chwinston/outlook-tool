@@ -233,6 +233,63 @@ _INTERNAL_DOMAIN = "membersolutions.com"
 # Each rule's docstring names the sample cluster it came from.
 
 
+# ===== safety exemptions (highest priority) =================================
+#
+# Added 2026-11-16 after Chris's walk-through surfaced four categories that
+# the generic marketing/noreply rules kept sweeping into safe-delete. Each
+# exemption routes to ``needs-action`` so the operator sees it explicitly.
+
+def _r_gcp_project_at_risk(msg: Message) -> bool:
+    """Google Cloud 'Project ... is at risk of suspension' — real action.
+
+    Cluster: ``CloudPlatform-noreply@google.com``. If ignored, the project
+    gets suspended. Walk-through 2026-11-16 flagged two of these
+    (msi-web + SalesClutch) as must-see.
+    """
+    sender = _sender(msg)
+    subj = _subject(msg)
+    return (
+        "cloudplatform-noreply@google.com" in sender
+        and "at risk of suspension" in subj.lower()
+    )
+
+
+def _r_google_account_recoverability(msg: Message) -> bool:
+    """Google Account recoverability / account-state notices — must-see.
+
+    Cluster: ``no-reply@accounts.google.com``. Walk-through 2026-11-16:
+    'Your Google Account is no longer recoverable' is load-bearing if it
+    pertains to a real account — operator must review.
+    """
+    sender = _sender(msg)
+    return "no-reply@accounts.google.com" in sender
+
+
+def _r_msi_billing_alert(msg: Message) -> bool:
+    """Internal MSI billing/credit-card alerts — operator must see.
+
+    Cluster: ``Alerts@Membersolutions.com``. Example: 'Credit Card Decline'.
+    Flagged in walk-through 2026-11-16 as needing operator eyes.
+    """
+    sender = _sender(msg)
+    return sender == "alerts@membersolutions.com"
+
+
+def _r_sharepoint_permission_change(msg: Message) -> bool:
+    """SharePoint anonymous-access link changes — audit trail, operator-review.
+
+    Cluster: ``no-reply@sharepointonline.com`` with 'changed an anonymous
+    access link' in subject. Walk-through 2026-11-16: these are real
+    permission audit-trail items (e.g. Jungle MMA YTD summary link).
+    """
+    sender = _sender(msg)
+    subj = _subject(msg).lower()
+    return (
+        sender.endswith("@sharepointonline.com")
+        and "anonymous access link" in subj
+    )
+
+
 # ===== needs-action =========================================================
 
 def _r_build_or_ci_failed(msg: Message) -> bool:
@@ -506,6 +563,13 @@ def _r_generic_noreply_old(msg: Message) -> bool:
 # ---------------------------------------------------------------------------
 
 RULES: List[Rule] = [
+    # safety exemptions (added 2026-11-16 from walk-through) — route to
+    # needs-action so the operator sees these, never auto-swept.
+    _rule("gcp-project-at-risk", "needs-action", _r_gcp_project_at_risk),
+    _rule("google-account-recoverability", "needs-action", _r_google_account_recoverability),
+    _rule("msi-billing-alert", "needs-action", _r_msi_billing_alert),
+    _rule("sharepoint-permission-change", "needs-action", _r_sharepoint_permission_change),
+
     # needs-action (highest priority — never auto-delete action-triggered mail)
     _rule("ci-build-failed", "needs-action", _r_build_or_ci_failed),
     _rule("hubspot-task-assignment", "needs-action", _r_hubspot_task_assignment),

@@ -62,6 +62,39 @@ def _msg(
 # ===========================================================================
 
 class TestTriageRules:
+    # ===== safety exemptions (added 2026-11-16 from walk-through) =============
+
+    def test_gcp_project_at_risk_is_needs_action(self):
+        m = _msg(
+            sender_email="CloudPlatform-noreply@google.com",
+            subject="Your Project: msi-web is at risk of suspension",
+        )
+        assert triage_rules.classify(m) == ("needs-action", "gcp-project-at-risk")
+
+    def test_google_account_recoverability_is_needs_action(self):
+        m = _msg(
+            sender_email="no-reply@accounts.google.com",
+            subject="Your Google Account is no longer recoverable",
+        )
+        assert triage_rules.classify(m) == ("needs-action", "google-account-recoverability")
+
+    def test_msi_billing_alert_is_needs_action(self):
+        m = _msg(
+            sender_email="Alerts@Membersolutions.com",
+            subject="Member Solutions Alert - Credit Card Decline",
+        )
+        assert triage_rules.classify(m) == ("needs-action", "msi-billing-alert")
+
+    def test_sharepoint_permission_change_is_needs_action(self):
+        m = _msg(
+            sender_email="no-reply@sharepointonline.com",
+            subject="Todd Blyth has changed an anonymous access link to \"JUNGLE-2026-YTD-SUMMARY\"",
+            received_datetime=datetime.now() - timedelta(days=28),
+        )
+        assert triage_rules.classify(m) == ("needs-action", "sharepoint-permission-change")
+
+    # ===========================================================================
+
     def test_ci_build_failed_catches_azure_devops(self):
         m = _msg(
             sender_email="azuredevops@microsoft.com",
@@ -112,11 +145,14 @@ class TestTriageRules:
 
     def test_internal_noreply_is_NOT_internal_person(self):
         """An alert from an internal automated address must not fall into
-        the internal-person rule (it should match a safe-delete rule instead
-        or fall through)."""
+        the internal-person rule — it has its own msi-billing-alert path
+        (added 2026-11-16 from walk-through)."""
         m = _msg(sender_email="alerts@membersolutions.com", subject="Hello")
-        bucket, _ = triage_rules.classify(m)
-        assert bucket != "needs-action"
+        bucket, matched = triage_rules.classify(m)
+        # The msi-billing-alert rule routes Alerts@Membersolutions.com to
+        # needs-action with its own rule — distinct from internal-person.
+        assert matched != "internal-person"
+        assert matched == "msi-billing-alert"
 
     def test_hubspot_ticket_comment(self):
         m = _msg(
