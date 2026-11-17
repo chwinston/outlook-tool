@@ -1,6 +1,6 @@
 # Backlog
 
-**Last groomed:** 2026-11-16 (added Bolt 4 — Inbox Triage + Write Verbs. Panel-approved 2026-11-16 by Tim/Rob/Fran/Al/Will. Three-phase ship: Phase 1 = write methods + `OperationResult` contract, Phase 2 = `/inbox-triage` skill + classifier/executor, Phase 3 = batching for throughput. 13 F-items graduated to rows below. Panel report: `docs/key_findings/20261116-1100-inbox-triage-write-verbs-Staff-Engineer-Panel.md`. Plan: `docs/pm/plans/20261116-1100-inbox-triage-plan.md`.) Prior: 2026-03-27 (Bolt 3 close).
+**Last groomed:** 2026-11-16 (Bolt 4 Phase 1 + Phase 2 SHIPPED via autonomous execution. 134 real-world soft-deletes on Chris's Inbox, 20/20 ship-gate hit, 1 verify bug found + fixed mid-run, 4 exemption rules added from walk-through. Phase 3 batching stays deferred. Captain's log: `docs/captains_log/20261116-2230-bolt4-inbox-triage-shipped.md`.) Prior 2026-11-16 (groomed): added Bolt 4 spec + panel approval. Prior: 2026-03-27 (Bolt 3 close).
 
 ## Completed
 
@@ -10,6 +10,9 @@
 | 9 | Create SECURITY.md | Bolt 2 |
 | 10 | Create REQUIREMENTS.md with REQ IDs | Bolt 2 |
 | 11 | Calendar event search (all 3 backends) | Bolt 2 |
+| 12 | Write verbs: move / delete / mark-read across 3 backends with OperationResult contract | Bolt 4 Phase 1 |
+| 13 | `/inbox-triage` skill: classifier + executor + 23 rules + operator manual | Bolt 4 Phase 2 |
+| 14 | Live validation: 134 real soft-deletes on Chris's Inbox (266→132) | Bolt 4 Phase 2 |
 
 ## Prioritized Items
 
@@ -29,28 +32,28 @@ Spec: `docs/pm/plans/20261116-1100-inbox-triage-plan.md`. Panel report: `docs/ke
 
 | # | Item | Size | Status | Panel F-tag | Notes |
 |---|------|------|--------|-------------|-------|
-| B4.1.1 | Add `OperationResult` dataclass to `outlook_tool.py` (shared contract across backends) | XS (15 min) | executable | F4 (Rob F1) | `{status, verified, message_id, operation, before_state, after_state, error_detail, backend, elapsed_ms}` |
-| B4.1.2 | Add `OutlookClient.move(message_id, target_folder) → OperationResult` dispatch method | XS (15 min) | executable | — | Thin dispatch to backend-specific impl |
-| B4.1.3 | `_AppleScriptBackend.move()` with Archive folder detect-and-create + round-trip verify | S (90 min) | executable | F1 (Tim) + F3 (Al) | Mac-primary path; silent-success is the dominant risk; verify catches it |
-| B4.1.4 | `_GraphBackend.move()` returns `status="unsupported"` without `Mail.ReadWrite` (don't auto-upgrade) | S (45 min) | executable | F2 (Rob) | Surface the scope cliff loudly |
-| B4.1.5 | COM backend `move()` with round-trip verify (Windows parity) | S (60 min) | executable | F1 (Tim) | Windows path |
-| B4.1.6 | `OutlookClient.delete(message_id, permanent=False, yes_really_permanent=False)` — soft-delete default, hard-delete requires double-flag | S (60 min) | executable | F6 (Tim + unanimous) | Dangerous op; guarded by design |
-| B4.1.7 | `OutlookClient.mark_read(message_id, read=True)` across all three backends | S (45 min) | executable | — | Lowest-risk write; rounds out surface |
-| B4.1.8 | CLI verbs `outlook-tool move/delete/mark-read` — dry-run default, `--apply` required for real write | S (60 min) | executable | F5 (Panel unanimous) | Safe-by-default CLI shape |
-| B4.1.9 | Unit + integration tests: 3 backends × 3 ops. Graph mocked with `respx`. AppleScript tested against disposable mailbox folder locally (not in CI). | M (120 min) | executable | — | Correctness guard |
-| B4.1.10 | CHANGELOG entry + README section documenting new verbs + `yes_really_permanent` safety | S (30 min) | executable | — | Operator docs |
+| B4.1.1 | Add `OperationResult` dataclass to `outlook_tool.py` (shared contract across backends) | XS (15 min) | ✅ done | F4 (Rob F1) | `{status, verified, message_id, operation, before_state, after_state, error_detail, backend, elapsed_ms}` |
+| B4.1.2 | Add `OutlookClient.move(message_id, target_folder) → OperationResult` dispatch method | XS (15 min) | ✅ done | — | Thin dispatch to backend-specific impl |
+| B4.1.3 | `_AppleScriptBackend.move()` with Archive folder detect-and-create + round-trip verify | S (90 min) | ✅ done | F1 (Tim) + F3 (Al) | Mac-primary path; silent-success is the dominant risk; verify catches it |
+| B4.1.4 | `_GraphBackend.move()` returns `status="unsupported"` without `Mail.ReadWrite` (don't auto-upgrade) | S (45 min) | ✅ done | F2 (Rob) | Surface the scope cliff loudly |
+| B4.1.5 | COM backend `move()` with round-trip verify (Windows parity) | S (60 min) | ✅ done | F1 (Tim) | Windows path |
+| B4.1.6 | `OutlookClient.delete(message_id, permanent=False, yes_really_permanent=False)` — soft-delete default, hard-delete requires double-flag | S (60 min) | ✅ done | F6 (Tim + unanimous) | Dangerous op; guarded by design |
+| B4.1.7 | `OutlookClient.mark_read(message_id, read=True)` across all three backends | S (45 min) | ✅ done | — | Lowest-risk write; rounds out surface |
+| B4.1.8 | CLI verbs `outlook-tool move/delete/mark-read` — dry-run default, `--apply` required for real write | S (60 min) | ✅ done | F5 (Panel unanimous) | Safe-by-default CLI shape |
+| B4.1.9 | Unit + integration tests: 3 backends × 3 ops. Graph mocked with `respx`. AppleScript tested against disposable mailbox folder locally (not in CI). | M (120 min) | ✅ done | — | Correctness guard |
+| B4.1.10 | CHANGELOG entry + README section documenting new verbs + `yes_really_permanent` safety | S (30 min) | ✅ done | — | Operator docs |
 
 ### Phase 2 — `/inbox-triage` skill (~9 hours total, blocked on Phase 1 complete)
 
 | # | Item | Size | Status | Panel F-tag | Notes |
 |---|------|------|--------|-------------|-------|
-| B4.2.1 | Create `.claude/skills/inbox-triage/SKILL.md` | S (30 min) | blocked on Phase 1 | — | Two-step workflow: classify → apply |
-| B4.2.2 | `scripts/triage.py` — classifier reading inbox via `outlook_tool.search`, emitting `output/triage-YYYYMMDD-HHMM.json` | M (180 min) | blocked on Phase 1 | F10 (Fran) | Classifier is its own concern |
-| B4.2.3 | `scripts/triage_rules.py` — initial rule base: 5 buckets (safe-delete / resolved-ticket / low-signal-client / needs-action / keep) | S (90 min) | executable (parallel with B4.2.2) | F10 (Fran) | Single Python file; grows additively |
-| B4.2.4 | `scripts/apply_triage.py` — reads report, prints markdown preview, applies when `--apply` passed. Supports `--bucket`. Refuses reports > 1 hour old. | M (120 min) | blocked on Phase 1 | F10 + F11 | Executor is separate from classifier |
-| B4.2.5 | Add rule provenance (`matched_rule`) to classifier output | XS (45 min) | blocked on B4.2.2, B4.2.3 | F9 (Rob) | Debuggability — tune the rule, not retrain a model |
-| B4.2.6 | Live validation on Chris's real inbox: produce triage report, review markdown, spot-check safe-delete bucket, confirm ≥ 18/20 correct before shipping | S (60 min) | blocked on B4.2.1-5 | — | Ship-gate acceptance criterion |
-| B4.2.7 | Operator manual `docs/manuals/inbox-triage.md` | S (45 min) | blocked on B4.2.1-5 | — | Two-command workflow docs |
+| B4.2.1 | Create `.claude/skills/inbox-triage/SKILL.md` | S (30 min) | ✅ done | — | Two-step workflow: classify → apply |
+| B4.2.2 | `scripts/triage.py` — classifier reading inbox via `outlook_tool.search`, emitting `output/triage-YYYYMMDD-HHMM.json` | M (180 min) | ✅ done | F10 (Fran) | Classifier is its own concern |
+| B4.2.3 | `scripts/triage_rules.py` — initial rule base: 5 buckets + 4 exemption rules added from live walk-through | S (90 min) | ✅ done | F10 (Fran) | 23 rules total (19 initial + 4 exemption) |
+| B4.2.4 | `scripts/apply_triage.py` — reads report, prints markdown preview, applies when `--apply` passed. `--exclude-ids` added for walk-through overrides. | M (120 min) | ✅ done | F10 + F11 | Executor is separate from classifier |
+| B4.2.5 | Add rule provenance (`matched_rule`) to classifier output | XS (45 min) | ✅ done | F9 (Rob) | Debuggability — tune the rule, not retrain a model |
+| B4.2.6 | Live validation: 134 real-world soft-deletes on Chris's Inbox (266→132). Ship-gate: 20/20 correct on spot-check. | S (60 min) | ✅ done | — | SHIPPED 2026-11-16 |
+| B4.2.7 | Operator manual `docs/manuals/inbox-triage.md` | S (45 min) | ✅ done | — | Two-command workflow docs |
 
 ### Phase 3 — Batching (~3-4 hours total, deferred until Phase 1 + 2 in use ≥ 1 week)
 
