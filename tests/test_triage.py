@@ -491,7 +491,9 @@ class TestApplyTriageMain:
             client = mock_cls.return_value
             client.backend = "applescript"
             client.delete.return_value = unverified
-            rc = apply_triage.main([str(report), "--bucket", "safe-delete", "--apply"])
+            rc = apply_triage.main([
+                str(report), "--bucket", "safe-delete", "--apply", "--no-bulk",
+            ])
         assert rc == 1, "unverified-success must be surfaced as failure (not clean exit)"
         combined = capsys.readouterr().out
         assert "UNVERIFIED-success" in combined
@@ -522,7 +524,9 @@ class TestApplyTriageMain:
             client = mock_cls.return_value
             client.backend = "applescript"
             client.delete.return_value = verified
-            rc = apply_triage.main([str(report), "--bucket", "safe-delete", "--apply"])
+            rc = apply_triage.main([
+                str(report), "--bucket", "safe-delete", "--apply", "--no-bulk",
+            ])
         assert rc == 0
 
     def test_fingerprint_recovery_when_initial_fails(self, tmp_path):
@@ -564,9 +568,142 @@ class TestApplyTriageMain:
                 "subject": "unique-subject-ABC",
                 "sender_email": "x@y.com",
             }]
-            rc = apply_triage.main([str(report), "--bucket", "safe-delete", "--apply"])
+            rc = apply_triage.main([
+                str(report), "--bucket", "safe-delete", "--apply", "--no-bulk",
+            ])
         assert rc == 0
         # Two calls — first with stale id, second with recovered id.
         calls = client.delete.call_args_list
         assert calls[0].args[0] == "as_msg_100"
         assert calls[1].args[0] == "as_msg_42"
+
+
+# ===========================================================================
+# Bolt 5 (B5.2) — apply_triage --bulk integration
+# ===========================================================================
+
+
+class TestApplyTriageBulkPath:
+    """`--bulk` default-on routes safe-delete through client.delete_bulk,
+    move buckets through client.move_bulk — one call per batch."""
+
+    def _write_fresh_report(self, tmp_path: Path, messages: list) -> Path:
+        path = tmp_path / "triage.json"
+        path.write_text(json.dumps({
+            "schema_version": 1,
+            "generated_at": datetime.now().isoformat(),
+            "backend": "applescript",
+            "sample_folder": "Inbox",
+            "sample_size": len(messages),
+            "window_days": 30,
+            "summary": {b: 0 for b in triage_rules.BUCKETS},
+            "messages": messages,
+        }))
+        return path
+
+    def _three_msgs(self):
+        return [
+            {
+                "message_id": f"as_msg_{i}",
+                "sender_email": f"a{i}@x.com",
+                "subject": f"s{i}",
+                "received_at": datetime.now().isoformat(),
+                "bucket": "safe-delete",
+                "matched_rule": "r",
+            }
+            for i in (5, 7, 9)
+        ]
+
+    def test_bulk_default_routes_safe_delete_through_delete_bulk(self, tmp_path):
+        report = self._write_fresh_report(tmp_path, messages=self._three_msgs())
+        bulk_results = [
+            OperationResult(
+                status="success", operation="delete",
+                message_id=f"as_msg_{i}", verified=True,
+                after_state={"folder": "Deleted Items", "permanent": False},
+                backend="applescript", elapsed_ms=5,
+            )
+            for i in (5, 7, 9)
+        ]
+        with patch("apply_triage.OutlookClient") as mock_cls:
+            client = mock_cls.return_value
+            client.backend = "applescript"
+            client.delete_bulk.return_value = bulk_results
+            rc = apply_triage.main([
+                str(report), "--bucket", "safe-delete", "--apply",
+            ])
+        # delete_bulk called ONCE with every message id.
+        client.delete_bulk.assert_called_once()
+        args, kwargs = client.delete_bulk.call_args
+        assert args[0] == ["as_msg_5", "as_msg_7", "as_msg_9"]
+        assert kwargs["permanent"] is False
+        assert kwargs["folder_name"] == "Inbox"
+        assert rc == 0
+        # Per-message delete() must NOT have been called.
+        client.delete.assert_not_called()
+
+    def test_bulk_routes_move_buckets_through_move_bulk(self, tmp_path):
+        msgs = self._three_msgs()
+        for m in msgs:
+            m["bucket"] = "resolved-ticket"
+        report = self._write_fresh_report(tmp_path, messages=msgs)
+        bulk_results = [
+            OperationResult(
+                status="success", operation="move",
+                message_id=f"as_msg_{i}", verified=True,
+                after_state={"folder": "Archive"},
+                backend="applescript", elapsed_ms=5,
+            )
+            for i in (5, 7, 9)
+        ]
+        with patch("apply_triage.OutlookClient") as mock_cls:
+            client = mock_cls.return_value
+            client.backend = "applescript"
+            client.move_bulk.return_value = bulk_results
+            rc = apply_triage.main([
+                str(report), "--bucket", "resolved-ticket", "--apply",
+            ])
+        client.move_bulk.assert_called_once()
+        args, kwargs = client.move_bulk.call_args
+        assert args[0] == [
+            ("as_msg_5", "Archive"),
+            ("as_msg_7", "Archive"),
+            ("as_msg_9", "Archive"),
+        ]
+        assert kwargs["source_folder"] == "Inbox"
+        assert rc == 0
+        client.move.assert_not_called()
+
+    def test_bulk_mixed_results_surface_as_non_zero(self, tmp_path):
+        """Partial bulk → some rows fail → exit code 1 (per policy)."""
+        report = self._write_fresh_report(tmp_path, messages=self._three_msgs())
+        mixed = [
+            OperationResult(status="success", operation="delete",
+                            message_id="as_msg_5", verified=True,
+                            backend="applescript"),
+            OperationResult(status="failed", operation="delete",
+                            message_id="as_msg_7", verified=False,
+                            error_detail="bulk partial", backend="applescript"),
+            OperationResult(status="success", operation="delete",
+                            message_id="as_msg_9", verified=False,
+                            error_detail="count-only", backend="applescript"),
+        ]
+        with patch("apply_triage.OutlookClient") as mock_cls:
+            client = mock_cls.return_value
+            client.backend = "applescript"
+            client.delete_bulk.return_value = mixed
+            rc = apply_triage.main([
+                str(report), "--bucket", "safe-delete", "--apply",
+            ])
+        assert rc == 1  # failed OR unverified-success → 1
+
+    def test_bulk_exception_tallies_everyone_as_skipped(self, tmp_path):
+        report = self._write_fresh_report(tmp_path, messages=self._three_msgs())
+        with patch("apply_triage.OutlookClient") as mock_cls:
+            client = mock_cls.return_value
+            client.backend = "applescript"
+            client.delete_bulk.side_effect = RuntimeError("osascript crashed")
+            rc = apply_triage.main([
+                str(report), "--bucket", "safe-delete", "--apply",
+            ])
+        assert rc == 1
