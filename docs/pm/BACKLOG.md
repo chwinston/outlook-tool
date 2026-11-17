@@ -1,6 +1,6 @@
 # Backlog
 
-**Last groomed:** 2026-11-16 (Bolt 4 Phase 1 + Phase 2 SHIPPED via autonomous execution. 134 real-world soft-deletes on Chris's Inbox, 20/20 ship-gate hit, 1 verify bug found + fixed mid-run, 4 exemption rules added from walk-through. Phase 3 batching stays deferred. Captain's log: `docs/captains_log/20261116-2230-bolt4-inbox-triage-shipped.md`.) Prior 2026-11-16 (groomed): added Bolt 4 spec + panel approval. Prior: 2026-03-27 (Bolt 3 close).
+**Last groomed:** 2026-11-17 (Opened Bolt 5 — Phase 3 batching trigger met early. Observed 44% silent-success failure rate on 43-msg apply run, far exceeding acceptable reliability. B4.3.* graduating to B5.*. Spec: `docs/pm/plans/20261117-0740-bolt5-batching-plan.md`.) Prior: 2026-11-16 (Bolt 4 Phase 1 + Phase 2 SHIPPED via autonomous execution. 134 real-world soft-deletes on Chris's Inbox, 20/20 ship-gate hit, 1 verify bug found + fixed mid-run, 4 exemption rules added from walk-through. Captain's log: `docs/captains_log/20261116-2230-bolt4-inbox-triage-shipped.md`.) Prior: 2026-03-27 (Bolt 3 close).
 
 ## Completed
 
@@ -55,13 +55,23 @@ Spec: `docs/pm/plans/20261116-1100-inbox-triage-plan.md`. Panel report: `docs/ke
 | B4.2.6 | Live validation: 134 real-world soft-deletes on Chris's Inbox (266→132). Ship-gate: 20/20 correct on spot-check. | S (60 min) | ✅ done | — | SHIPPED 2026-11-16 |
 | B4.2.7 | Operator manual `docs/manuals/inbox-triage.md` | S (45 min) | ✅ done | — | Two-command workflow docs |
 
-### Phase 3 — Batching (~3-4 hours total, deferred until Phase 1 + 2 in use ≥ 1 week)
+### Phase 3 — Batching (GRADUATED to Bolt 5 on 2026-11-17 — trigger met early)
 
-| # | Item | Size | Status | Panel F-tag | Notes |
-|---|------|------|--------|-------------|-------|
-| B4.3.1 | AppleScript bulk-move: single `move messages {id1, id2, ...} to folder "Archive"` per target folder | S (90 min) | deferred (with trigger) | F7 (Al) | 5-10× speedup; trigger = Phase 1+2 in use ≥ 1 week OR 500+ message op complaint |
-| B4.3.2 | Graph `$batch` POST up to 20 ops/call, honor `Retry-After` on 429 | S (90 min) | deferred (with trigger) | F8 (Al) | Only relevant after `Mail.ReadWrite` granted; same trigger as 4.3.1 |
-| B4.3.3 | Benchmark 500-message archive before + after Phase 3 (`scripts/bench_triage.py`) | XS (30 min) | deferred | — | Prove the win |
+Original B4.3.* rows have moved to Bolt 5 below. Observed 44% silent-success failure rate on round-4 apply run made this reliability work, not throughput work.
+
+## Bolt 5 — Silent-Success Fix + Batching (NEW 2026-11-17)
+
+Spec: `docs/pm/plans/20261117-0740-bolt5-batching-plan.md`
+
+**Trigger evidence:** 4 apply-triage runs on real Inbox showed silent-success rate climbing from 30% → 44%. The deferred trigger for B4.3.* ("500+ msg complaint OR 1 week of use") is a proxy for reliability pain; that pain is already here at 43-msg sizes.
+
+| # | Item | Size | Status | Notes |
+|---|------|------|--------|-------|
+| B5.1 | Root-cause AppleScript silent-success (index-shift vs sync-lag vs verify-side-effect hypotheses) | M (3-4h) | executable | BLOCKING for B5.2 — pick a shape based on root cause |
+| B5.2 | AppleScript bulk-move primitive (shape A/B/C per B5.1) — single tell block capturing refs before any move | M (2-3h) | blocked on B5.1 | Was B4.3.1 |
+| B5.3 | Verify-step hardening — fix phantom UNVERIFIED-success (scan-limit-200 miss under mutation) | S (90 min) | executable | Addresses apply_triage.py reporting accuracy |
+| B5.4 | Graph `$batch` POST | S (90 min) | still deferred (needs IT ticket) | Was B4.3.2 — blocked on `Mail.ReadWrite` scope |
+| B5.5 | Benchmark 500-msg archive — current vs bulk-move | S (60 min) | blocked on B5.2 | Was B4.3.3; ship-gate ≥ 95% verified-success |
 
 ### Deferred from Bolt 4 (with named triggers)
 
