@@ -1469,3 +1469,200 @@ class TestTriageClassifyInboxWiring:
                 report = triage.classify_inbox(window_days=30, max_results=10)
         mock_llm.assert_not_called()
         assert "llm_summary" not in report
+
+
+# ===========================================================================
+# Bolt 6 Phase B.4 — end-to-end smoke test
+# ===========================================================================
+
+
+class TestBolt6EndToEndSmoke:
+    """One integration test that exercises the full Bolt 6 pipeline
+    without touching Outlook or Anthropic: rules path produces a mixed
+    report, the unread-junk gate re-routes LLM-flagged messages, and
+    apply_triage renders the correct final-state preview under --no-apply.
+
+    Covers the three canonical shapes:
+      1. rule-matched junk (safe-delete via marketing-sender) — untouched
+         by LLM, untouched by gate.
+      2. keep + LLM-junk + unread — upgraded by the gate to safe-delete.
+      3. keep + no LLM verdict — stays as keep (gate silent).
+    """
+
+    def test_full_pipeline_dry_run(self, tmp_path, capsys):
+        import triage  # noqa: WPS433
+
+        now = datetime.now()
+        inbox = [
+            # #1: rule-matched junk — marketing-sender fires in triage_rules.
+            {
+                "id": "as_msg_rule_junk",
+                "sender_email": "hello@birdeye.com",
+                "sender_name": "Birdeye",
+                "subject": "[2026 Report] The State of AI Search",
+                "received_datetime": now - timedelta(days=2),
+                "is_read": True,
+                "body_preview": "A promotional email from Birdeye.",
+                "folder": "Inbox",
+            },
+            # #2: rules → keep, LLM will label junk at 0.9, unread → gate
+            # upgrades to safe-delete.
+            {
+                "id": "as_msg_llm_junk",
+                "sender_email": "random-person@random-example.co",
+                "sender_name": "Random Person",
+                "subject": "Quick note",
+                "received_datetime": now - timedelta(days=1),
+                "is_read": False,
+                "body_preview": "Ignore this — just saying hi.",
+                "folder": "Inbox",
+            },
+            # #3: rules → keep, no LLM verdict → stays as keep.
+            {
+                "id": "as_msg_no_verdict",
+                "sender_email": "important@partner.com",
+                "sender_name": "Important Partner",
+                "subject": "Contract details",
+                "received_datetime": now - timedelta(days=1),
+                "is_read": False,
+                "body_preview": "Please find the attached contract.",
+                "folder": "Inbox",
+            },
+        ]
+
+        client = MagicMock()
+        client.backend = "applescript"
+
+        def _search(**kwargs):
+            folder = kwargs.get("folder") or "Inbox"
+            if folder == "Sent Items":
+                return []
+            return inbox
+
+        client.search.side_effect = _search
+
+        def fake_llm(messages, **_kw):
+            out = []
+            for m in messages:
+                new = dict(m)
+                if m["message_id"] == "as_msg_llm_junk":
+                    new["llm_verdict"] = {
+                        "bucket": "junk",
+                        "confidence": 0.9,
+                        "reason": "mock",
+                        "route": "auto",
+                    }
+                # as_msg_no_verdict gets no verdict attached
+                out.append(new)
+            return out
+
+        # Run classify + LLM to build a complete report.
+        with patch("triage.OutlookClient", return_value=client):
+            with patch(
+                "triage_llm.classify_messages_with_llm",
+                side_effect=fake_llm,
+            ):
+                report = triage.classify_inbox(
+                    window_days=30, max_results=10,
+                    use_llm=True, llm_limit=10,
+                )
+
+        # Pre-gate assertions: rules + LLM worked.
+        by_id_pre = {m["message_id"]: m for m in report["messages"]}
+        assert by_id_pre["as_msg_rule_junk"]["bucket"] == "safe-delete"
+        assert by_id_pre["as_msg_rule_junk"]["matched_rule"] in (
+            "marketing-sender", "list-unsubscribe-bulk",
+        )
+        assert by_id_pre["as_msg_llm_junk"]["bucket"] == "keep"
+        assert by_id_pre["as_msg_llm_junk"]["llm_verdict"]["bucket"] == "junk"
+        assert by_id_pre["as_msg_no_verdict"]["bucket"] == "keep"
+        assert "llm_verdict" not in by_id_pre["as_msg_no_verdict"]
+
+        # Write the report; have apply_triage's main() dry-run against it.
+        report_path = tmp_path / "triage.json"
+        report_path.write_text(json.dumps(report, indent=2, default=str))
+
+        with patch("apply_triage.OutlookClient") as mock_cls:
+            rc = apply_triage.main([
+                str(report_path), "--bucket", "safe-delete",
+            ])
+
+        # Dry-run → no client instantiated, exit 0.
+        mock_cls.assert_not_called()
+        assert rc == 0
+
+        out = capsys.readouterr().out
+
+        # The gate fired during main() — the Markdown preview must show
+        # BOTH the rule-matched junk AND the upgraded keep message in
+        # the safe-delete bucket.
+        assert "Triage Preview — safe-delete bucket (2 messages)" in out
+        assert "hello@birdeye.com" in out
+        assert "random-person@random-example.co" in out
+        # Provenance: the upgraded row must carry unread-junk-upgrade.
+        assert "unread-junk-upgrade" in out
+        # The untouched keep message must NOT appear in safe-delete preview.
+        assert "important@partner.com" not in out
+
+    def test_full_pipeline_no_unread_junk_rule_flag_keeps_keep_bucket(
+        self, tmp_path, capsys,
+    ):
+        """With --no-unread-junk-rule, the gate must NOT upgrade the LLM-
+        flagged keep-junk message — it stays in keep."""
+        import triage  # noqa: WPS433
+
+        now = datetime.now()
+        inbox = [{
+            "id": "as_msg_llm_junk",
+            "sender_email": "random-person@random-example.co",
+            "sender_name": "Random Person",
+            "subject": "Quick note",
+            "received_datetime": now - timedelta(days=1),
+            "is_read": False,
+            "body_preview": "Ignore this.",
+            "folder": "Inbox",
+        }]
+        client = MagicMock()
+        client.backend = "applescript"
+        client.search.side_effect = (
+            lambda **kw: [] if kw.get("folder") == "Sent Items" else inbox
+        )
+
+        def fake_llm(messages, **_kw):
+            out = []
+            for m in messages:
+                new = dict(m)
+                new["llm_verdict"] = {
+                    "bucket": "junk",
+                    "confidence": 0.95,
+                    "reason": "mock",
+                    "route": "auto",
+                }
+                out.append(new)
+            return out
+
+        with patch("triage.OutlookClient", return_value=client):
+            with patch(
+                "triage_llm.classify_messages_with_llm",
+                side_effect=fake_llm,
+            ):
+                report = triage.classify_inbox(
+                    window_days=30, max_results=10,
+                    use_llm=True, llm_limit=10,
+                )
+
+        report_path = tmp_path / "triage.json"
+        report_path.write_text(json.dumps(report, indent=2, default=str))
+
+        with patch("apply_triage.OutlookClient"):
+            rc = apply_triage.main([
+                str(report_path),
+                "--bucket", "safe-delete",
+                "--no-unread-junk-rule",
+            ])
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Message stayed in keep bucket, so safe-delete preview is empty.
+        assert "Triage Preview — safe-delete bucket (0 messages)" in out
+        assert "random-person@random-example.co" not in out
