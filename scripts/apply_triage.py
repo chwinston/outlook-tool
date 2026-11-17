@@ -54,6 +54,19 @@ from outlook_tool import OperationResult, OutlookClient  # noqa: E402
 # because AppleScript message ids become session-stale.
 MAX_REPORT_AGE_SECONDS = 60 * 60  # 1 hour
 
+# Bolt 6 Phase B.3: confidence floor for the unread-junk re-route gate.
+# When ``apply_bucket`` runs with ``--unread-junk-rule`` on (default), any
+# message whose LLM verdict is ``bucket=="junk"`` at confidence >= this
+# threshold AND ``is_read == False`` will be re-routed to safe-delete
+# from the softer archivable buckets (resolved-ticket / low-signal-client)
+# or from keep. This mirrors Chris's explicit heuristic: "unread + junk
+# = delete."
+UNREAD_JUNK_CONFIDENCE_FLOOR = 0.85
+
+# Buckets that are softened (archive-worthy) but can be upgraded to
+# safe-delete when the unread-junk gate fires.
+UNREAD_JUNK_SOURCE_BUCKETS = ("resolved-ticket", "low-signal-client", "keep")
+
 # Per-bucket destination for move operations. ``None`` means the bucket is
 # preview-only; the executor will not automatically act on it even with
 # ``--apply``.
@@ -64,6 +77,95 @@ BUCKET_ACTIONS: Dict[str, Optional[str]] = {
     "needs-action": None,
     "keep": None,
 }
+
+
+# ---------------------------------------------------------------------------
+# Unread-junk re-route gate (Bolt 6 Phase B.3)
+# ---------------------------------------------------------------------------
+
+def apply_unread_junk_gate(
+    report: Dict[str, Any],
+    *,
+    confidence_floor: float = UNREAD_JUNK_CONFIDENCE_FLOOR,
+) -> Dict[str, Any]:
+    """Re-route unread + high-confidence-junk messages to safe-delete.
+
+    Chris's explicit heuristic: "unread + junk = delete." The rules path
+    is deliberately conservative — a routine FYI from a client or a
+    resolved-ticket notification goes to the archivable buckets, not to
+    safe-delete, because pattern rules alone can't tell "junk I'll never
+    read" from "FYI I may want later." The LLM reads the body and
+    recovers that signal, and the gate here acts on it:
+
+      - If ``bucket`` is in ``UNREAD_JUNK_SOURCE_BUCKETS``
+      - AND ``is_read == False``
+      - AND ``llm_verdict.bucket == "junk"``
+      - AND ``llm_verdict.confidence >= confidence_floor``
+      → route to ``safe-delete`` with
+         ``matched_rule = "unread-junk-upgrade"`` and preserve the
+         original rule in ``unread_junk_upgrade``.
+
+    The function mutates a shallow copy of the report so callers can
+    diff or log the before/after. The report's ``summary`` is recounted
+    in place.
+    """
+    new_report = dict(report)
+    new_messages: List[Dict[str, Any]] = []
+    upgrades = 0
+    for msg in report.get("messages", []):
+        if _should_upgrade_unread_junk(msg, confidence_floor):
+            upgraded = dict(msg)
+            upgraded["unread_junk_upgrade"] = {
+                "from_bucket": msg.get("bucket"),
+                "from_rule": msg.get("matched_rule"),
+                "llm_confidence": (
+                    msg.get("llm_verdict") or {}
+                ).get("confidence"),
+            }
+            upgraded["bucket"] = "safe-delete"
+            upgraded["matched_rule"] = "unread-junk-upgrade"
+            new_messages.append(upgraded)
+            upgrades += 1
+        else:
+            new_messages.append(msg)
+
+    new_report["messages"] = new_messages
+
+    # Recount the summary — upgrades change bucket populations.
+    summary = {b: 0 for b in (
+        "safe-delete", "resolved-ticket", "low-signal-client",
+        "needs-action", "keep",
+    )}
+    for m in new_messages:
+        b = m.get("bucket")
+        if b in summary:
+            summary[b] += 1
+    new_report["summary"] = summary
+    new_report["unread_junk_upgrades"] = upgrades
+    return new_report
+
+
+def _should_upgrade_unread_junk(
+    msg: Dict[str, Any],
+    confidence_floor: float,
+) -> bool:
+    """Return True iff this message meets the unread-junk re-route gate.
+
+    Guarded by: current bucket is archivable-or-keep, message is unread,
+    LLM verdict is high-confidence junk.
+    """
+    if msg.get("bucket") not in UNREAD_JUNK_SOURCE_BUCKETS:
+        return False
+    if bool(msg.get("is_read", False)):
+        return False
+    verdict = msg.get("llm_verdict") or {}
+    if verdict.get("bucket") != "junk":
+        return False
+    try:
+        conf = float(verdict.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return False
+    return conf >= confidence_floor
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +681,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--unread-junk-rule", dest="unread_junk_rule", action="store_true",
+        default=True,
+        help=(
+            "Enable the Bolt 6 Phase B.3 unread-junk re-route gate "
+            "(default on). Any message in resolved-ticket / "
+            "low-signal-client / keep that is unread AND carries an "
+            "LLM verdict of 'junk' at confidence >= 0.85 is upgraded "
+            "to safe-delete before the applier fires. Mirrors Chris's "
+            "'unread + junk = delete' heuristic."
+        ),
+    )
+    parser.add_argument(
+        "--no-unread-junk-rule", dest="unread_junk_rule", action="store_false",
+        help="Opt out of the unread-junk re-route gate.",
+    )
+    parser.add_argument(
+        "--unread-junk-confidence-floor", type=float,
+        default=UNREAD_JUNK_CONFIDENCE_FLOOR,
+        help=(
+            "LLM confidence floor for the unread-junk gate "
+            f"(default: {UNREAD_JUNK_CONFIDENCE_FLOOR})."
+        ),
+    )
+    parser.add_argument(
         "--yes-really-permanent", action="store_true",
         help=argparse.SUPPRESS,  # Documented NO. Catch & refuse.
     )
@@ -612,6 +738,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 2
+
+    # Bolt 6 Phase B.3 — apply the unread-junk re-route gate BEFORE any
+    # preview or write. The gate is a pure data transform; running it
+    # pre-preview means the operator sees the upgraded buckets in the
+    # Markdown preview and can spot-check before --apply.
+    if args.unread_junk_rule:
+        report = apply_unread_junk_gate(
+            report,
+            confidence_floor=args.unread_junk_confidence_floor,
+        )
+        upgrades = report.get("unread_junk_upgrades", 0)
+        if upgrades:
+            print(
+                f"unread-junk gate: upgraded {upgrades} message(s) to "
+                f"safe-delete (confidence floor "
+                f"{args.unread_junk_confidence_floor}).",
+                file=sys.stderr,
+            )
 
     exclude_ids = {
         s.strip() for s in (args.exclude_ids or "").split(",") if s.strip()

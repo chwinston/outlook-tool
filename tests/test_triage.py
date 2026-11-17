@@ -1103,6 +1103,168 @@ class TestApplyTriageBulkPath:
 
 
 # ===========================================================================
+# Bolt 6 Phase B.3 — apply_triage.apply_unread_junk_gate re-route
+# ===========================================================================
+
+
+class TestUnreadJunkGate:
+    """``apply_unread_junk_gate`` upgrades unread + high-confidence-junk
+    messages from the archivable buckets (resolved-ticket /
+    low-signal-client) or ``keep`` into ``safe-delete``. Mirrors Chris's
+    'unread + junk = delete' heuristic (Bolt 6 Phase B.3)."""
+
+    def _msg_rec(
+        self,
+        *,
+        message_id: str = "as_msg_1",
+        bucket: str = "keep",
+        is_read: bool = False,
+        llm_bucket: str | None = None,
+        llm_confidence: float | None = None,
+        matched_rule: str = "default",
+    ) -> dict:
+        rec = {
+            "message_id": message_id,
+            "sender_email": "x@y.com",
+            "subject": "s",
+            "received_at": datetime.now().isoformat(),
+            "bucket": bucket,
+            "is_read": is_read,
+            "matched_rule": matched_rule,
+            "body_preview": "",
+        }
+        if llm_bucket is not None:
+            rec["llm_verdict"] = {
+                "bucket": llm_bucket,
+                "confidence": llm_confidence if llm_confidence is not None else 0.0,
+                "reason": "test",
+                "route": "auto",
+            }
+        return rec
+
+    def _report(self, messages: list) -> dict:
+        return {
+            "schema_version": 1,
+            "generated_at": datetime.now().isoformat(),
+            "backend": "applescript",
+            "sample_folder": "Inbox",
+            "sample_size": len(messages),
+            "window_days": 30,
+            "summary": {b: 0 for b in triage_rules.BUCKETS},
+            "messages": messages,
+        }
+
+    def test_keep_unread_high_confidence_junk_upgrades_to_safe_delete(self):
+        """Classic shape: rules left it as keep, LLM says junk at 0.9,
+        unread → upgrade."""
+        rec = self._msg_rec(
+            bucket="keep", is_read=False,
+            llm_bucket="junk", llm_confidence=0.9,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "safe-delete"
+        assert new_report["messages"][0]["matched_rule"] == "unread-junk-upgrade"
+        assert new_report["messages"][0]["unread_junk_upgrade"]["from_bucket"] == "keep"
+        assert new_report["unread_junk_upgrades"] == 1
+
+    def test_resolved_ticket_unread_junk_upgrades(self):
+        """resolved-ticket is in the upgradable set — unread + junk
+        should move it to safe-delete."""
+        rec = self._msg_rec(
+            bucket="resolved-ticket", is_read=False,
+            llm_bucket="junk", llm_confidence=0.95,
+            matched_rule="hubspot-ticket-comment",
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "safe-delete"
+        assert new_report["messages"][0]["unread_junk_upgrade"]["from_rule"] == "hubspot-ticket-comment"
+
+    def test_low_signal_client_unread_junk_upgrades(self):
+        """low-signal-client is also in the upgradable set."""
+        rec = self._msg_rec(
+            bucket="low-signal-client", is_read=False,
+            llm_bucket="junk", llm_confidence=0.88,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "safe-delete"
+
+    def test_read_junk_does_not_upgrade(self):
+        """Read messages must NOT be upgraded (Chris's rule requires unread)."""
+        rec = self._msg_rec(
+            bucket="keep", is_read=True,
+            llm_bucket="junk", llm_confidence=0.95,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "keep"
+        assert new_report["unread_junk_upgrades"] == 0
+
+    def test_low_confidence_junk_does_not_upgrade(self):
+        """Confidence < 0.85 → no upgrade."""
+        rec = self._msg_rec(
+            bucket="keep", is_read=False,
+            llm_bucket="junk", llm_confidence=0.70,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "keep"
+        assert new_report["unread_junk_upgrades"] == 0
+
+    def test_non_junk_llm_verdict_does_not_upgrade(self):
+        """LLM says 'reference' at high confidence → NOT a delete signal."""
+        rec = self._msg_rec(
+            bucket="keep", is_read=False,
+            llm_bucket="reference", llm_confidence=0.95,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "keep"
+
+    def test_needs_action_bucket_protected_from_upgrade(self):
+        """needs-action messages must NOT be touched — the point is to
+        protect action signal from being swept to safe-delete even when
+        the LLM screws up and calls them junk."""
+        rec = self._msg_rec(
+            bucket="needs-action", is_read=False,
+            llm_bucket="junk", llm_confidence=0.95,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "needs-action"
+        assert new_report["unread_junk_upgrades"] == 0
+
+    def test_safe_delete_bucket_unchanged(self):
+        """Already-safe-delete stays put — gate only upgrades, never
+        downgrades."""
+        rec = self._msg_rec(
+            bucket="safe-delete", is_read=False,
+            llm_bucket="junk", llm_confidence=0.95,
+            matched_rule="marketing-sender",
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["matched_rule"] == "marketing-sender"
+        assert new_report["unread_junk_upgrades"] == 0
+
+    def test_summary_recounted_after_upgrade(self):
+        """When the gate fires, the summary block must reflect the new
+        bucket distribution."""
+        messages = [
+            self._msg_rec(message_id="a", bucket="keep", is_read=False,
+                          llm_bucket="junk", llm_confidence=0.9),
+            self._msg_rec(message_id="b", bucket="keep", is_read=True,
+                          llm_bucket="junk", llm_confidence=0.9),
+            self._msg_rec(message_id="c", bucket="needs-action", is_read=False),
+        ]
+        new_report = apply_triage.apply_unread_junk_gate(self._report(messages))
+        assert new_report["summary"]["safe-delete"] == 1
+        assert new_report["summary"]["keep"] == 1
+        assert new_report["summary"]["needs-action"] == 1
+
+    def test_message_without_llm_verdict_unchanged(self):
+        """No llm_verdict attached → gate has nothing to act on; passes through."""
+        rec = self._msg_rec(bucket="keep", is_read=False)
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "keep"
+        assert "unread_junk_upgrade" not in new_report["messages"][0]
+
+
+# ===========================================================================
 # Bolt 6 Phase B.1 — triage.py wiring (context, body_preview, --llm)
 # ===========================================================================
 
