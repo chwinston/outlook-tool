@@ -56,8 +56,17 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 Message = Dict[str, Any]
+# Per-run context used by rules that need cross-message signals (e.g.
+# "did Chris ever reply to this sender?"). Keys currently in use:
+#   - ``sent_to_counts``: ``Dict[str, int]`` — lowercased recipient email →
+#     number of messages Chris sent TO that address in the lookback window.
+#   - ``sender_counts``: ``Dict[str, int]`` — lowercased sender email →
+#     number of inbox messages seen from that sender in the sample.
+# Rules that don't need context accept it anyway and ignore it, so the
+# dispatcher stays uniform.
+Context = Optional[Dict[str, Any]]
 RuleResult = Optional[Tuple[str, str]]
-Rule = Callable[[Message], RuleResult]
+Rule = Callable[[Message, Context], RuleResult]
 
 # Valid buckets. Classifier and executor both read from this.
 BUCKETS = (
@@ -103,12 +112,31 @@ def _age_days(msg: Message, *, now: Optional[datetime] = None) -> Optional[float
     return (reference - dt).total_seconds() / 86400.0
 
 
-def _rule(name: str, bucket: str, predicate: Callable[[Message], bool]) -> Rule:
-    """Wrap a predicate into a named rule callable."""
+def _rule(
+    name: str,
+    bucket: str,
+    predicate: Callable[..., bool],
+) -> Rule:
+    """Wrap a predicate into a named rule callable.
+
+    Predicates may be 1-arg ``(msg) -> bool`` or 2-arg
+    ``(msg, context) -> bool``. The wrapper detects arity once at
+    registration and dispatches accordingly, so both styles coexist.
+    """
     assert bucket in BUCKETS, f"invalid bucket: {bucket}"
 
-    def _impl(msg: Message) -> RuleResult:
-        return (bucket, name) if predicate(msg) else None
+    # Introspect predicate arity so legacy 1-arg predicates still work.
+    try:
+        import inspect
+
+        sig = inspect.signature(predicate)
+        wants_context = len(sig.parameters) >= 2
+    except (TypeError, ValueError):
+        wants_context = False
+
+    def _impl(msg: Message, context: Context = None) -> RuleResult:
+        matched = predicate(msg, context) if wants_context else predicate(msg)
+        return (bucket, name) if matched else None
 
     _impl.__name__ = name
     _impl.rule_name = name  # type: ignore[attr-defined]
@@ -599,21 +627,108 @@ RULES: List[Rule] = [
 ]
 
 
-def classify(msg: Message) -> Tuple[str, str]:
+def classify(msg: Message, context: Context = None) -> Tuple[str, str]:
     """Apply RULES in order, return ``(bucket, matched_rule)``.
+
+    Args:
+        msg: Inbox message dict (see :class:`OutlookClient.search` output).
+        context: Optional per-run context. See the :data:`Context` type
+            alias at the top of this module for the supported keys. Rules
+            that don't need it ignore it; rules that do (e.g.
+            ``ignored-sender-cold``) read from it to detect "did Chris
+            ever reply to this sender" without touching Outlook again.
 
     Falls through to ``("keep", "default")`` if no rule matches.
     """
     for rule in RULES:
-        result = rule(msg)
+        result = rule(msg, context)
         if result is not None:
             return result
     return ("keep", "default")
+
+
+def build_sent_context(
+    client: Any,
+    *,
+    days_lookback: int = 365,
+    max_results: int = 5000,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Scan Sent Items once and build a ``{recipient_email: count}`` map.
+
+    Used by rules that need to detect "did the operator ever reply to this
+    sender" without re-querying Outlook per message. Call once at the top
+    of a triage run and pass the result into :func:`classify` via the
+    ``context`` argument.
+
+    Args:
+        client: An :class:`OutlookClient` (duck-typed; must expose
+            ``search(folder=..., date_from=..., date_to=..., max_results=...)``
+            returning dicts with a ``to`` field).
+        days_lookback: How far back to scan Sent Items. Defaults to one
+            year — enough to catch dormant threads without blowing up
+            runtime on huge sent folders.
+        max_results: Upper bound on messages scanned. Guards against a
+            pathological sent folder.
+        now: Test hook for the current time.
+
+    Returns:
+        A context dict shaped like::
+
+            {
+                "sent_to_counts": {"alice@example.com": 3, ...},
+                "scanned_messages": 142,
+                "days_lookback": 365,
+            }
+
+        Safe to pass directly to :func:`classify`.
+    """
+    reference = now or datetime.now()
+    since = reference - timedelta(days=days_lookback)
+
+    try:
+        messages = client.search(
+            folder="Sent Items",
+            date_from=since.strftime("%Y-%m-%d"),
+            date_to=reference.strftime("%Y-%m-%d"),
+            max_results=max_results,
+        )
+    except Exception:  # pragma: no cover — defensive; empty context is safe fallback
+        messages = []
+
+    counts: Dict[str, int] = {}
+    for m in messages:
+        to_field = (m.get("to") or "").strip()
+        if not to_field:
+            continue
+        # ``to`` is a comma-separated string in both backends; split and
+        # normalize each address. We keep only the raw email token — no
+        # name parsing, no angle-bracket tolerance (search() has already
+        # projected these to plain addresses in the AppleScript backend,
+        # and Graph returns address-only forms).
+        for raw in to_field.split(","):
+            addr = raw.strip().lower()
+            if not addr:
+                continue
+            # Trim any "Name <addr>" form just in case.
+            if "<" in addr and ">" in addr:
+                addr = addr.split("<", 1)[1].rstrip(">").strip()
+            if "@" not in addr:
+                continue
+            counts[addr] = counts.get(addr, 0) + 1
+
+    return {
+        "sent_to_counts": counts,
+        "scanned_messages": len(messages),
+        "days_lookback": days_lookback,
+    }
 
 
 __all__ = [
     "BUCKETS",
     "RULES",
     "Rule",
+    "Context",
     "classify",
+    "build_sent_context",
 ]

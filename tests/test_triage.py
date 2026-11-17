@@ -290,6 +290,69 @@ class TestTriageRules:
 
 
 # ===========================================================================
+# triage_rules.build_sent_context — Bolt 6 A1 sent-items helper
+# ===========================================================================
+
+class TestBuildSentContext:
+    """``build_sent_context`` scans Sent Items and returns a count-by-
+    recipient map used by the ``ignored-sender-cold`` rule."""
+
+    def _client_with_sent(self, sent_messages):
+        client = MagicMock()
+        client.search.return_value = sent_messages
+        return client
+
+    def test_builds_recipient_counts(self):
+        client = self._client_with_sent([
+            {"to": "alice@example.com"},
+            {"to": "alice@example.com, bob@example.com"},
+            {"to": "bob@example.com"},
+        ])
+        ctx = triage_rules.build_sent_context(client, days_lookback=30)
+        assert ctx["sent_to_counts"]["alice@example.com"] == 2
+        assert ctx["sent_to_counts"]["bob@example.com"] == 2
+        assert ctx["scanned_messages"] == 3
+        assert ctx["days_lookback"] == 30
+
+    def test_normalizes_case_and_whitespace(self):
+        client = self._client_with_sent([
+            {"to": "Alice@Example.COM"},
+            {"to": "  alice@example.com  "},
+        ])
+        ctx = triage_rules.build_sent_context(client)
+        assert ctx["sent_to_counts"]["alice@example.com"] == 2
+
+    def test_strips_angle_bracket_form(self):
+        client = self._client_with_sent([
+            {"to": "Alice <alice@example.com>"},
+        ])
+        ctx = triage_rules.build_sent_context(client)
+        assert ctx["sent_to_counts"].get("alice@example.com") == 1
+
+    def test_empty_to_field_ignored(self):
+        client = self._client_with_sent([
+            {"to": ""},
+            {"to": None},
+            {},
+        ])
+        ctx = triage_rules.build_sent_context(client)
+        assert ctx["sent_to_counts"] == {}
+        assert ctx["scanned_messages"] == 3
+
+    def test_search_called_with_sent_items(self):
+        client = self._client_with_sent([])
+        triage_rules.build_sent_context(
+            client, days_lookback=365, max_results=5000,
+        )
+        client.search.assert_called_once()
+        kwargs = client.search.call_args.kwargs
+        assert kwargs["folder"] == "Sent Items"
+        assert kwargs["max_results"] == 5000
+        assert "date_from" in kwargs
+        assert "date_to" in kwargs
+
+
+# ===========================================================================
 # apply_triage.load_report — freshness / errors
 # ===========================================================================
 
