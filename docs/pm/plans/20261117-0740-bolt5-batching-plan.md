@@ -112,6 +112,30 @@ Total: ~7-9 hours.
 - [ ] Zero regressions on existing `/inbox-triage` workflow — same two-command UX, same CLI
 - [ ] CHANGELOG entry documenting the silent-success fix
 
-## Appendix: pick-off experiment (2026-11-17)
+## Appendix: pick-off experiment results (2026-11-17 07:49)
 
-Mid-session workaround: after round 4 apply returned 19 real + 11 UNVERIFIED-success failures (44% silent-success), ran 34 remaining safe-delete messages one-at-a-time via `cli.py delete <id> --apply` with 2s sleep between calls. Processed from highest message_id to lowest to avoid index-shift. Result TBD pending completion — if success rate approaches 100%, that confirms hypothesis 1 (index-shift race) and shape C becomes the minimum viable fix.
+Ran 34 remaining safe-delete messages one-at-a-time via `cli.py delete <id> --apply` with 2s sleep between calls, from highest message_id to lowest.
+
+**Reported outcome:** 24 ok, 10 failed (71%)
+**Actual outcome (from Inbox count delta 99 → 65):** 34 ok (100%)
+**False-failure rate:** 29% — verify misreported moves that actually succeeded
+
+### What this tells us
+
+**Hypothesis 1 (index-shift race): REJECTED.** Descending order + sleep didn't fix apparent failures, yet 100% of moves actually succeeded. Index shifts aren't the cause.
+
+**Hypothesis 2 (Exchange sync lag): STRONGLY SUPPORTED.** Move completes server-side immediately, but the `_verify_present_in_folder` scan runs against the Outlook client's cached state, which still shows the message in Inbox until Exchange→client sync settles. Verify returns False before the local view catches up.
+
+**Hypothesis 3 (verify-side-effect): PARTIAL.** The verify scan opening a new AppleScript session mid-settle may itself destabilize the sync.
+
+### Revised B5.1 scope
+
+Skip hypothesis 1 experiments. Focus on:
+
+1. **Settle delay** — add configurable wait (e.g. 500ms–2s) between move and verify. Measure false-failure rate as function of delay.
+2. **EntryID-based verify** — instead of fingerprint scan, try to re-fetch the message by its original AppleScript ID in the source folder. If the ID resolves to a different message (or doesn't resolve), the move succeeded. Doesn't depend on client-cache sync.
+3. **Verify-free write with sync-poll** — don't verify per-message. Fire all moves in a single AppleScript block, then poll the source folder count until it drops by N.
+
+### Revised B5.2 shape preference
+
+**Shape A (single tell block capturing refs before any move)** is now preferred — it addresses the sync-lag issue by batching all moves server-side before any client read-back is attempted. Shape C (sort+sleep) no longer has strong supporting evidence.
