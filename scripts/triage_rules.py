@@ -178,6 +178,30 @@ _UNSUBSCRIBE_HINT_RE = re.compile(
     re.I,
 )
 
+# Bolt 6 Phase B.2 (from A3 marketplace scan): list-unsubscribe-header is
+# the single highest-precision bulk-sender signal in commercial AI mail
+# tools. OutlookClient doesn't expose raw headers today — so as a cheap
+# fallback we look for the markers that bulk senders almost always
+# render into the message body alongside the header. Any one of these
+# phrases + the word "unsubscribe" in the body preview is near-perfect
+# bulk precision.
+_LIST_UNSUBSCRIBE_BODY_RE = re.compile(
+    r"("
+    r"unsubscribe (?:here|link|from this|from all|at any time)"
+    r"|click (?:here )?to unsubscribe"
+    r"|to unsubscribe,"
+    r"|manage (?:your )?(?:email )?(?:subscription|preferences|notifications)"
+    r"|update (?:your )?(?:email )?(?:subscription|preferences|notifications)"
+    r"|email preferences"
+    r"|you(?:'| a)?re receiving this (?:email |message )?because"
+    r"|you are receiving this (?:email |message )?because"
+    r"|you have received this (?:email|message) because"
+    r"|view (?:this )?(?:email |message )?in (?:your )?browser"
+    r"|was sent to you by"
+    r")",
+    re.I,
+)
+
 _RESOLVED_HINT_RE = re.compile(
     r"\b(resolved|closed|completed|complete|finished|has been closed)\b",
     re.I,
@@ -773,6 +797,25 @@ def _r_google_alerts_digest(msg: Message) -> bool:
     return _sender(msg) == "googlealerts-noreply@google.com"
 
 
+def _r_list_unsubscribe_bulk(msg: Message) -> bool:
+    """Body preview contains List-Unsubscribe-style markers — bulk sender.
+
+    Bolt 6 Phase B.2 (win from A3 marketplace scan). Commercial AI mail
+    tools lean on the ``List-Unsubscribe`` RFC header as the single
+    highest-precision bulk-sender signal — near-perfect precision at
+    zero LLM cost. OutlookClient does not surface headers today, so we
+    use a body-side fallback: any one of the common "unsubscribe here",
+    "manage subscriptions", or "you're receiving this because" markers
+    is strong enough to safe-delete. Narrower than
+    ``unsubscribe-marketing`` (which only fires on the subject line) so
+    it catches newsletter bodies with plain subjects.
+    """
+    body = (msg.get("body_preview") or "")
+    if not body:
+        return False
+    return bool(_LIST_UNSUBSCRIBE_BODY_RE.search(body))
+
+
 def _r_marketing_sender(msg: Message) -> bool:
     """Known marketing / cold-outbound senders — domain OR local-part match.
 
@@ -871,6 +914,10 @@ RULES: List[Rule] = [
     _rule("ci-success-old", "safe-delete", _r_ci_success_old),
     _rule("dependabot-old", "safe-delete", _r_dependabot_old),
     _rule("google-alerts-digest", "safe-delete", _r_google_alerts_digest),
+    # List-Unsubscribe body markers (Bolt 6 Phase B.2 from A3 scan).
+    # Sits above the marketing-sender enumeration so the long-tail
+    # newsletters that aren't in _MARKETING_DOMAINS still get caught.
+    _rule("list-unsubscribe-bulk", "safe-delete", _r_list_unsubscribe_bulk),
     _rule("marketing-sender", "safe-delete", _r_marketing_sender),
     _rule("platform-notification-old", "safe-delete", _r_platform_notification_old),
     _rule("unsubscribe-marketing", "safe-delete", _r_unsubscribe_marketing),

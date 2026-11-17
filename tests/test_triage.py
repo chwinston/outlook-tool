@@ -44,6 +44,7 @@ def _msg(
     is_read: bool = False,
     folder: str = "Inbox",
     to: str = "",
+    body_preview: str = "",
 ) -> dict:
     return {
         "id": message_id,
@@ -54,6 +55,7 @@ def _msg(
         "is_read": is_read,
         "folder": folder,
         "to": to,
+        "body_preview": body_preview,
     }
 
 
@@ -270,6 +272,57 @@ class TestTriageRules:
         # safe-delete rule is acceptable.
         assert bucket == "safe-delete"
         assert rule in ("marketing-sender", "unsubscribe-marketing")
+
+    # ---- Bolt 6 B.2 — list-unsubscribe-bulk (A3 marketplace-scan win) ---
+
+    def test_list_unsubscribe_bulk_from_body(self):
+        """A novel-domain sender with a classic unsubscribe-body marker
+        must land in safe-delete — this is the long-tail newsletter
+        catchment the rule was designed for."""
+        m = _msg(
+            sender_email="hello@novel-newsletter-domain-xyz.io",
+            subject="November Digest",
+            body_preview=(
+                "This is the November issue. Read more at the link. "
+                "You're receiving this because you signed up at example.com. "
+                "Unsubscribe here."
+            ),
+            received_datetime=datetime.now() - timedelta(days=2),
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert bucket == "safe-delete"
+        assert rule == "list-unsubscribe-bulk"
+
+    def test_list_unsubscribe_bulk_manage_preferences_marker(self):
+        """The 'manage preferences' variant must also match."""
+        m = _msg(
+            sender_email="updates@brand.example",
+            subject="Product update",
+            body_preview=(
+                "Here's what's new this month. Manage your email preferences "
+                "at the link below."
+            ),
+            received_datetime=datetime.now() - timedelta(days=5),
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert bucket == "safe-delete"
+        # marketing-sender might still win on senders with a marketing local
+        # part; here the sender is novel so list-unsubscribe-bulk should win.
+        assert rule == "list-unsubscribe-bulk"
+
+    def test_list_unsubscribe_bulk_requires_marker(self):
+        """A plain personal email with no unsubscribe marker must NOT
+        match this rule (precision guard)."""
+        m = _msg(
+            sender_email="friend@external-person.example",
+            subject="Dinner next week?",
+            body_preview="Hey, are you free for dinner next Thursday?",
+            received_datetime=datetime.now() - timedelta(days=1),
+        )
+        bucket, rule = triage_rules.classify(m)
+        # The "?" in subject lands it in needs-action via question-in-subject;
+        # the critical assertion is: list-unsubscribe-bulk must NOT fire.
+        assert rule != "list-unsubscribe-bulk"
 
     def test_generic_noreply_old(self):
         old = datetime.now() - timedelta(days=20)
