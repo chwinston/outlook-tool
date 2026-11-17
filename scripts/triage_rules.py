@@ -244,6 +244,82 @@ _PLATFORM_NOTIFICATION_DOMAINS = {
 
 _INTERNAL_DOMAIN = "membersolutions.com"
 
+# Operator — used by Bolt 6 behavioral rules that need to know "did Chris
+# ever reply." Kept here (not in a config) because the rule set is
+# single-tenant today. When multi-tenant lands, lift to a settings object.
+_OPERATOR_EMAIL = "cfossenier@membersolutions.com"
+
+# Cold-outreach / outbound-SaaS senders — patterns, not an enumeration.
+# These regexes match against the full sender email (local@domain,
+# lowercased). Hitting one of these + no reply-from-operator + age > 30d
+# is strong enough signal to safe-delete.
+#
+# Sources: observed in Chris's inbox 2026-11-16 + 2026-11-17 Bolt 5 sweep
+# + well-known outbound-tooling domains. Regex form lets us catch
+# per-tenant subdomains ("foo.outreach.io", "mail.salesloft.com") without
+# enumerating every one.
+_COLD_OUTREACH_DOMAIN_PATTERNS = [
+    re.compile(p, re.I)
+    for p in (
+        r".*\.outreach\.io$",
+        r".*outreach\.io$",
+        r".*salesloft\.com$",
+        r".*\.salesloft\.com$",
+        r".*apollo\.io$",
+        r".*\.apollo\.io$",
+        r".*lemlist\.com$",
+        r".*\.lemlist\.com$",
+        r".*instantly\.ai$",
+        r".*\.instantly\.ai$",
+        r".*send\.intercom\.com$",
+        r".*pb02\.wixemails\.com$",
+        r".*wixemails\.com$",
+        r".*mailchimpapp\.net$",
+        r".*mail\.mailchimp\.com$",
+        r".*sendgrid\.net$",
+        r".*mandrillapp\.com$",
+        r".*hubspotemail\.net$",  # outbound HubSpot blasts (not notifications.hubspot.com)
+        r".*gartner\.com$",       # cold analyst outreach
+        r".*reply\.io$",
+        r".*woodpecker\.co$",
+        r".*persistiq\.com$",
+    )
+]
+
+
+def _matches_cold_outreach_domain(email: str) -> bool:
+    """True when the sender domain matches any cold-outreach pattern."""
+    if "@" not in email:
+        return False
+    domain = email.split("@", 1)[1].lower().strip()
+    return any(p.match(domain) for p in _COLD_OUTREACH_DOMAIN_PATTERNS)
+
+
+def _sent_scan_available(context: Context) -> bool:
+    """True when a Sent Items scan was built for this run.
+
+    ``sent_to_counts`` is only present when :func:`build_sent_context`
+    (or an equivalent) was called. Rules that depend on "did the operator
+    reply" must short-circuit when the scan wasn't done — otherwise they
+    would over-classify on the default ``classify(msg)`` path used by
+    existing callers.
+    """
+    return bool(context and "sent_to_counts" in context)
+
+
+def _operator_has_replied(sender_email: str, context: Context) -> bool:
+    """True if the operator has sent anything to this address in-window.
+
+    Reads ``context['sent_to_counts']`` populated by
+    :func:`build_sent_context`. Callers MUST guard with
+    :func:`_sent_scan_available` first — this helper assumes the scan
+    ran and only answers the per-sender question.
+    """
+    if not context:
+        return False
+    counts = context.get("sent_to_counts") or {}
+    return counts.get(sender_email.lower().strip(), 0) > 0
+
 
 # ---------------------------------------------------------------------------
 # Rules — ORDERED. First match wins.
@@ -488,6 +564,160 @@ def _r_workday_task(msg: Message) -> bool:
     return _sender(msg).endswith("@myworkday.com")
 
 
+# ===== Bolt 6 behavioral rules (2026-11-17) =================================
+#
+# These rules look at CROSS-MESSAGE signals — "did Chris reply?", "how
+# old is this thread?", "has the sender gone dormant?". They go above
+# the classic safe-delete rules so pattern-based detection wins over
+# domain enumeration on the long tail.
+#
+# All five require a fresh ``context`` dict (see :func:`build_sent_context`).
+# Rules short-circuit to False when no Sent-Items scan was built — this
+# preserves the behavior of every existing ``classify(msg)`` caller
+# that doesn't pass a context.
+
+
+def _r_ignored_sender_cold(msg: Message, context: Context) -> bool:
+    """Operator has NEVER replied to this sender and oldest msg > 60 days.
+
+    Signal: sender has ≥ 3 messages in the inbox sample, zero sent-items
+    hits for the operator, and this message is > 60 days old. If Chris
+    never wrote back in two months, the sender is cold.
+
+    Requires:
+      - ``context['sent_to_counts']`` from :func:`build_sent_context`
+      - ``context['sender_counts']`` (optional) — map of sender_email to
+        inbox-sample count. If absent, we skip the volume floor and
+        rely on the "never replied" + age signal alone.
+    """
+    if not _sent_scan_available(context):
+        return False
+    sender = _sender(msg)
+    if not sender:
+        return False
+    # Skip internal — internal-person owns that bucket.
+    if sender.endswith(f"@{_INTERNAL_DOMAIN}"):
+        return False
+    # Skip the operator themselves (defensive; sometimes shows up as a bcc echo).
+    if sender == _OPERATOR_EMAIL.lower():
+        return False
+    if _operator_has_replied(sender, context):
+        return False
+    age = _age_days(msg)
+    if age is None or age <= 60:
+        return False
+    # Optional volume floor — only fires when the context exposes
+    # per-sender inbox counts. Keeps us out of false-positive territory
+    # on rare one-off senders.
+    sender_counts = (context or {}).get("sender_counts") or {}
+    if sender_counts:
+        if sender_counts.get(sender, 0) < 3:
+            return False
+    return True
+
+
+def _r_dead_thread_reference(msg: Message, context: Context) -> bool:
+    """Reply thread (``Re:`` chain) > 90 days old, operator spoke last.
+
+    Signal: subject starts with ``Re:`` (or contains a ``Re:`` chain)
+    AND received > 90 days ago AND the operator has sent at least one
+    message to this address within the window. That combination means
+    "Chris already replied; nothing new came back." Archivable.
+
+    This is an archive-bucket rule (routes to ``resolved-ticket``), not
+    a delete — these are prior conversations that may be worth
+    referencing later.
+    """
+    if not _sent_scan_available(context):
+        return False
+    subj = _subject(msg)
+    if not subj:
+        return False
+    low = subj.lower()
+    # "Re:" chain detection — covers "Re:", "RE:", "Re: Re:", "FWD: Re:".
+    if not (
+        low.startswith("re:")
+        or low.startswith("re ")
+        or " re:" in low[:25]
+    ):
+        return False
+    age = _age_days(msg)
+    if age is None or age <= 90:
+        return False
+    sender = _sender(msg)
+    if not sender:
+        return False
+    # Internal people are owned by internal-person; don't archive those.
+    if sender.endswith(f"@{_INTERNAL_DOMAIN}"):
+        return False
+    # Operator must have engaged at least once — otherwise it's a cold
+    # thread the operator ignored, which belongs to ignored-sender-cold.
+    if not _operator_has_replied(sender, context):
+        return False
+    return True
+
+
+def _r_cold_outreach_dormant(msg: Message, context: Context) -> bool:
+    """Cold-outreach domain + no operator reply + > 30 days.
+
+    Signal: sender domain matches one of the known outbound-tooling
+    patterns in :data:`_COLD_OUTREACH_DOMAIN_PATTERNS`, the operator
+    never replied, and the message is > 30 days old. This is the
+    "SalesLoft drip that never got a response" cluster.
+    """
+    if not _sent_scan_available(context):
+        return False
+    sender = _sender(msg)
+    if not sender or not _matches_cold_outreach_domain(sender):
+        return False
+    if _operator_has_replied(sender, context):
+        return False
+    age = _age_days(msg)
+    return age is not None and age > 30
+
+
+def _r_bulk_marketing_tail(msg: Message, context: Context) -> bool:
+    """Known marketing sender + > 30 days + unread.
+
+    Signal: sender matches :func:`_looks_like_marketing_sender`
+    (domain or local-part), the message is > 30 days old, AND it's
+    unread. Marketing mail Chris never even opened is the clearest
+    delete-candidate in the inbox — Chris's explicit rule:
+    "unread + junk = delete".
+
+    Note: distinct from the existing ``marketing-sender`` rule, which
+    fires regardless of age/read-state. This rule sits ABOVE the
+    broader one so unread-tail marketing gets its more specific label.
+    """
+    if not _looks_like_marketing_sender(msg):
+        return False
+    if msg.get("is_read") is not False:  # treat missing as "assume read"
+        return False
+    age = _age_days(msg)
+    return age is not None and age > 30
+
+
+def _r_unread_automation_30d(msg: Message, context: Context) -> bool:
+    """Automated-sender pattern + unread + > 30 days.
+
+    Signal: ``is_read == False`` AND local-part matches an automated
+    pattern (``noreply`` / ``notifications`` / ``alerts`` / ...) AND
+    > 30 days old. Same "unread + junk = delete" principle as
+    ``bulk-marketing-tail``, but for automation that isn't marketing.
+
+    Exemption rules still win because they sit higher in RULES — a
+    CloudPlatform at-risk message or SharePoint permission change
+    won't fall here even if unread and old.
+    """
+    if msg.get("is_read") is not False:
+        return False
+    sender = _sender(msg)
+    if not sender or not _AUTOMATED_LOCAL_RE.match(sender):
+        return False
+    age = _age_days(msg)
+    return age is not None and age > 30
+
+
 # ===== safe-delete ==========================================================
 
 def _r_cloudwatch_alarm_old(msg: Message) -> bool:
@@ -605,6 +835,12 @@ RULES: List[Rule] = [
     _rule("question-in-subject", "needs-action", _r_question_in_subject),
     _rule("internal-person", "needs-action", _r_direct_from_internal_person),
 
+    # Bolt 6 behavioral archive — dead "Re:" threads where Chris already
+    # replied and nothing new came back. Sits above the ticket rules so
+    # a 90+ day old reply chain gets the behavioral label, not a generic
+    # ticket-notification one.
+    _rule("dead-thread-reference", "resolved-ticket", _r_dead_thread_reference),
+
     # resolved-ticket (archive, don't delete)
     _rule("hubspot-ticket-comment", "resolved-ticket", _r_hubspot_ticket_comment),
     _rule("resolved-or-closed-notification", "resolved-ticket", _r_resolved_or_closed_notification),
@@ -614,6 +850,21 @@ RULES: List[Rule] = [
     _rule("mystudio-failed-payment-rerun", "low-signal-client", _r_mystudio_failed_payment_rerun),
     _rule("hubspot-tasks-today-digest", "low-signal-client", _r_hubspot_tasks_today_digest),
     _rule("workday-notification", "low-signal-client", _r_workday_task),
+
+    # Bolt 6 behavioral safe-delete — cross-message signals that beat
+    # the classic domain enumeration. They sit above the pattern rules
+    # so provenance stays precise (``cold-outreach-dormant`` is a more
+    # useful matched_rule than ``marketing-sender`` when both apply).
+    #
+    # Order within this block, most specific → least specific:
+    #   cold-outreach-dormant  (known outbound-SaaS domain)
+    #   bulk-marketing-tail    (known marketing domain + unread + age)
+    #   unread-automation-30d  (automated local-part + unread + age)
+    #   ignored-sender-cold    (behavioral — any non-internal sender)
+    _rule("cold-outreach-dormant", "safe-delete", _r_cold_outreach_dormant),
+    _rule("bulk-marketing-tail", "safe-delete", _r_bulk_marketing_tail),
+    _rule("unread-automation-30d", "safe-delete", _r_unread_automation_30d),
+    _rule("ignored-sender-cold", "safe-delete", _r_ignored_sender_cold),
 
     # safe-delete (automated noise, age-gated)
     _rule("cloudwatch-alarm-old", "safe-delete", _r_cloudwatch_alarm_old),

@@ -353,6 +353,283 @@ class TestBuildSentContext:
 
 
 # ===========================================================================
+# Bolt 6 A1 — new behavioral pattern rules
+# ===========================================================================
+
+class TestNewPatternRules:
+    """Behavioral rules added in Bolt 6 Phase A1.
+
+    These rules require a per-run ``context`` dict (see
+    :func:`triage_rules.build_sent_context`). Each rule has at least a
+    positive test, a negative test, and an edge-case test that would
+    trip up a less careful implementation.
+    """
+
+    # ---- ignored-sender-cold -------------------------------------------
+
+    def test_ignored_sender_cold_positive(self):
+        """Cold sender, > 60 days old, no reply from Chris → safe-delete."""
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Checking in on our last conversation",
+            received_datetime=datetime.now() - timedelta(days=75),
+        )
+        ctx = {
+            "sent_to_counts": {},  # Chris has never written to this address
+            "sender_counts": {"rep@unknown-vendor.io": 4},
+        }
+        assert triage_rules.classify(m, ctx) == (
+            "safe-delete", "ignored-sender-cold",
+        )
+
+    def test_ignored_sender_cold_blocks_when_chris_replied(self):
+        """If Chris EVER replied, the rule must NOT fire."""
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Checking in on our last conversation",
+            received_datetime=datetime.now() - timedelta(days=75),
+        )
+        ctx = {
+            "sent_to_counts": {"rep@unknown-vendor.io": 1},
+            "sender_counts": {"rep@unknown-vendor.io": 4},
+        }
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "ignored-sender-cold"
+
+    def test_ignored_sender_cold_requires_age(self):
+        """Age < 60 days → rule must NOT fire even if never replied."""
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Quick follow-up",
+            received_datetime=datetime.now() - timedelta(days=30),
+        )
+        ctx = {
+            "sent_to_counts": {},
+            "sender_counts": {"rep@unknown-vendor.io": 4},
+        }
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "ignored-sender-cold"
+
+    def test_ignored_sender_cold_skips_internal(self):
+        """Internal sender must stay with internal-person, not get
+        auto-swept by the cold rule."""
+        m = _msg(
+            sender_email="coworker@membersolutions.com",
+            subject="Old update",
+            received_datetime=datetime.now() - timedelta(days=90),
+        )
+        ctx = {
+            "sent_to_counts": {},
+            "sender_counts": {"coworker@membersolutions.com": 10},
+        }
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule == "internal-person"
+        assert bucket == "needs-action"
+
+    def test_ignored_sender_cold_no_context_noop(self):
+        """Without a Sent-Items scan, the rule must NOT fire — preserves
+        backward compat for existing ``classify(msg)`` callers."""
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Checking in",
+            received_datetime=datetime.now() - timedelta(days=75),
+        )
+        bucket, rule = triage_rules.classify(m)  # no context
+        assert rule != "ignored-sender-cold"
+
+    def test_ignored_sender_cold_volume_floor_enforced(self):
+        """Volume floor: fewer than 3 inbox messages from this sender ⇒
+        rule must NOT fire (avoid false positives on one-off senders)."""
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Checking in",
+            received_datetime=datetime.now() - timedelta(days=75),
+        )
+        ctx = {
+            "sent_to_counts": {},
+            "sender_counts": {"rep@unknown-vendor.io": 1},
+        }
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "ignored-sender-cold"
+
+    # ---- dead-thread-reference -----------------------------------------
+
+    def test_dead_thread_reference_positive(self):
+        """Re: thread > 90 days old + Chris replied once → archive."""
+        m = _msg(
+            sender_email="vendor@external.com",
+            subject="Re: Contract Renewal Discussion",
+            received_datetime=datetime.now() - timedelta(days=120),
+        )
+        ctx = {"sent_to_counts": {"vendor@external.com": 2}}
+        assert triage_rules.classify(m, ctx) == (
+            "resolved-ticket", "dead-thread-reference",
+        )
+
+    def test_dead_thread_reference_requires_re_prefix(self):
+        """Fresh subject (no Re: chain) → rule must NOT fire."""
+        m = _msg(
+            sender_email="vendor@external.com",
+            subject="New Contract Proposal",
+            received_datetime=datetime.now() - timedelta(days=120),
+        )
+        ctx = {"sent_to_counts": {"vendor@external.com": 2}}
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "dead-thread-reference"
+
+    def test_dead_thread_reference_requires_chris_engagement(self):
+        """If Chris never wrote back, this is ignored-sender-cold
+        territory, not dead-thread."""
+        m = _msg(
+            sender_email="vendor@external.com",
+            subject="Re: Our product",
+            received_datetime=datetime.now() - timedelta(days=120),
+        )
+        ctx = {"sent_to_counts": {}}  # no reply
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "dead-thread-reference"
+
+    # ---- cold-outreach-dormant -----------------------------------------
+
+    def test_cold_outreach_dormant_positive(self):
+        """Known outbound-SaaS domain + no reply + > 30 days → safe-delete."""
+        m = _msg(
+            sender_email="hello@foo.outreach.io",
+            subject="Can I get 15 minutes?",
+            received_datetime=datetime.now() - timedelta(days=45),
+        )
+        ctx = {"sent_to_counts": {}}
+        assert triage_rules.classify(m, ctx) == (
+            "safe-delete", "cold-outreach-dormant",
+        )
+
+    def test_cold_outreach_dormant_salesloft(self):
+        """SalesLoft subdomain matches the pattern."""
+        m = _msg(
+            sender_email="noreply@mail.salesloft.com",
+            subject="Following up",
+            received_datetime=datetime.now() - timedelta(days=60),
+        )
+        ctx = {"sent_to_counts": {}}
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule == "cold-outreach-dormant"
+        assert bucket == "safe-delete"
+
+    def test_cold_outreach_dormant_blocked_by_reply(self):
+        """Operator replied to the outreach sender → rule must NOT fire."""
+        m = _msg(
+            sender_email="hello@foo.outreach.io",
+            subject="Can I get 15 minutes?",
+            received_datetime=datetime.now() - timedelta(days=45),
+        )
+        ctx = {"sent_to_counts": {"hello@foo.outreach.io": 1}}
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "cold-outreach-dormant"
+
+    def test_cold_outreach_dormant_age_floor(self):
+        """Under 30 days → not dormant yet."""
+        m = _msg(
+            sender_email="hello@foo.outreach.io",
+            subject="Quick note",
+            received_datetime=datetime.now() - timedelta(days=15),
+        )
+        ctx = {"sent_to_counts": {}}
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "cold-outreach-dormant"
+
+    # ---- bulk-marketing-tail -------------------------------------------
+
+    def test_bulk_marketing_tail_positive(self):
+        """Marketing-domain sender + unread + > 30 days → safe-delete."""
+        m = _msg(
+            sender_email="hello@birdeye.com",
+            subject="Monthly product update",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=False,
+        )
+        assert triage_rules.classify(m) == (
+            "safe-delete", "bulk-marketing-tail",
+        )
+
+    def test_bulk_marketing_tail_read_falls_through(self):
+        """Read marketing mail → generic marketing-sender rule wins,
+        bulk-marketing-tail must NOT claim it."""
+        m = _msg(
+            sender_email="hello@birdeye.com",
+            subject="Monthly product update",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=True,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert bucket == "safe-delete"
+        # Read mail must NOT be labelled bulk-marketing-tail.
+        assert rule != "bulk-marketing-tail"
+
+    def test_bulk_marketing_tail_age_floor(self):
+        """Fresh unread marketing → other rules may handle it, but NOT
+        this one (needs the 30-day cliff)."""
+        m = _msg(
+            sender_email="hello@birdeye.com",
+            subject="Monthly product update",
+            received_datetime=datetime.now() - timedelta(days=5),
+            is_read=False,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert rule != "bulk-marketing-tail"
+
+    # ---- unread-automation-30d -----------------------------------------
+
+    def test_unread_automation_30d_positive(self):
+        """Noreply automation + unread + > 30 days → safe-delete."""
+        m = _msg(
+            sender_email="noreply@unknown-saas.io",
+            subject="Your weekly report",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=False,
+        )
+        assert triage_rules.classify(m) == (
+            "safe-delete", "unread-automation-30d",
+        )
+
+    def test_unread_automation_30d_requires_unread(self):
+        """Read automation falls through to generic-noreply-old, NOT
+        unread-automation-30d."""
+        m = _msg(
+            sender_email="noreply@unknown-saas.io",
+            subject="Your weekly report",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=True,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert bucket == "safe-delete"
+        assert rule != "unread-automation-30d"
+
+    def test_unread_automation_30d_exemption_still_wins(self):
+        """Exemption rules sit higher: GCP at-risk must NOT get
+        swept into unread-automation-30d even when unread + old."""
+        m = _msg(
+            sender_email="CloudPlatform-noreply@google.com",
+            subject="Your Project: msi-web is at risk of suspension",
+            received_datetime=datetime.now() - timedelta(days=60),
+            is_read=False,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert rule == "gcp-project-at-risk"
+        assert bucket == "needs-action"
+
+    def test_unread_automation_30d_human_sender_not_matched(self):
+        """Human sender (not noreply/notifications) → rule must NOT fire."""
+        m = _msg(
+            sender_email="jane.doe@partner.co",
+            subject="Checking in",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=False,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert rule != "unread-automation-30d"
+
+
+# ===========================================================================
 # apply_triage.load_report — freshness / errors
 # ===========================================================================
 
