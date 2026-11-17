@@ -16,6 +16,9 @@ graph = [
     "msal>=1.28.0",
     "requests>=2.31.0",
 ]
+llm = [
+    "anthropic>=0.40",
+]
 
 [project.scripts]
 outlook-tool = "cli:main"
