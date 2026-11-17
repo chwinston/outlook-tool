@@ -1047,3 +1047,210 @@ class TestApplyTriageBulkPath:
                 str(report), "--bucket", "safe-delete", "--apply",
             ])
         assert rc == 1
+
+
+# ===========================================================================
+# Bolt 6 Phase B.1 — triage.py wiring (context, body_preview, --llm)
+# ===========================================================================
+
+
+class TestTriageClassifyInboxWiring:
+    """Phase B.1 — triage.classify_inbox must thread sent-items context
+    into every classify() call and preserve body_preview + is_read on the
+    projected report so the LLM gate has what it needs.
+    """
+
+    def _client_with_inbox(
+        self,
+        inbox: list,
+        sent: list | None = None,
+    ):
+        """Mock an OutlookClient. Inbox vs. Sent Items branches on folder kwarg."""
+        import triage  # noqa: WPS433 — local import for patching
+
+        sent = sent or []
+        client = MagicMock()
+        client.backend = "applescript"
+
+        def _search(**kwargs):
+            folder = kwargs.get("folder") or "Inbox"
+            if folder == "Sent Items":
+                return sent
+            return inbox
+
+        client.search.side_effect = _search
+        return client
+
+    def test_body_preview_and_is_read_in_projection(self):
+        """A classified record must include body_preview + is_read so the
+        downstream LLM gate (triage_llm) can read them."""
+        import triage  # noqa: WPS433
+
+        inbox = [
+            {
+                "id": "as_msg_1",
+                "sender_email": "x@y.com",
+                "sender_name": "X",
+                "subject": "hello",
+                "received_datetime": datetime.now() - timedelta(days=2),
+                "is_read": False,
+                "body_preview": "Please take a look at this.",
+                "folder": "Inbox",
+            },
+        ]
+        client = self._client_with_inbox(inbox)
+        with patch("triage.OutlookClient", return_value=client):
+            report = triage.classify_inbox(window_days=30, max_results=10)
+        assert report["sample_size"] == 1
+        rec = report["messages"][0]
+        assert rec["body_preview"] == "Please take a look at this."
+        assert rec["is_read"] is False
+
+    def test_sent_context_built_once_and_threaded(self):
+        """build_sent_context must be called once; behavioral rules
+        (ignored-sender-cold) must see the context and fire."""
+        import triage  # noqa: WPS433
+
+        # Inbox: 3 messages from a cold sender, > 60 days old, never replied.
+        # This is the ignored-sender-cold shape.
+        old = datetime.now() - timedelta(days=90)
+        inbox = [
+            {
+                "id": f"as_msg_{i}",
+                "sender_email": "rep@unknown-vendor.io",
+                "sender_name": "rep",
+                "subject": f"ping {i}",
+                "received_datetime": old,
+                "is_read": True,
+                "body_preview": "",
+                "folder": "Inbox",
+            }
+            for i in range(3)
+        ]
+        client = self._client_with_inbox(inbox, sent=[])
+        with patch("triage.OutlookClient", return_value=client):
+            report = triage.classify_inbox(window_days=365, max_results=100)
+
+        # At least one record must have matched ignored-sender-cold — the
+        # volume floor (sender_counts >= 3) and the never-replied signal
+        # (sent_to_counts == {}) both must come from the context.
+        matched_rules = [r["matched_rule"] for r in report["messages"]]
+        assert "ignored-sender-cold" in matched_rules
+
+        # Sanity: the report's sent_context block records the scan.
+        assert "sent_context" in report
+        assert report["sent_context"]["days_lookback"] == 365
+
+    def test_sent_context_handles_empty_sent_folder(self):
+        """A zero-result Sent Items scan must not crash the pipeline."""
+        import triage  # noqa: WPS433
+
+        inbox = [{
+            "id": "as_msg_1",
+            "sender_email": "x@y.com",
+            "sender_name": "X",
+            "subject": "hello",
+            "received_datetime": datetime.now(),
+            "is_read": True,
+            "body_preview": "",
+            "folder": "Inbox",
+        }]
+        client = self._client_with_inbox(inbox, sent=[])
+        with patch("triage.OutlookClient", return_value=client):
+            report = triage.classify_inbox(window_days=30, max_results=10)
+        assert report["sample_size"] == 1
+        assert report["sent_context"]["scanned_messages"] == 0
+
+    def test_llm_flag_calls_classify_messages_with_llm_only_for_keep(self):
+        """--llm must only send keep-bucket messages to the LLM; the gate
+        is additive (never overwrites bucket / matched_rule)."""
+        import triage  # noqa: WPS433
+
+        # Inbox: 2 marketing msgs (rules → safe-delete) + 1 generic keep msg.
+        now = datetime.now()
+        inbox = [
+            {
+                "id": "as_msg_1",
+                "sender_email": "hello@birdeye.com",
+                "sender_name": "Birdeye",
+                "subject": "promo",
+                "received_datetime": now,
+                "is_read": True,
+                "body_preview": "Monthly product update from Birdeye",
+                "folder": "Inbox",
+            },
+            {
+                "id": "as_msg_2",
+                "sender_email": "person@random.com",
+                "sender_name": "Person",
+                "subject": "random subject",
+                "received_datetime": now,
+                "is_read": False,
+                "body_preview": "Hey, interesting article you might like",
+                "folder": "Inbox",
+            },
+        ]
+        client = self._client_with_inbox(inbox, sent=[])
+
+        def fake_llm(messages, **_kw):
+            out = []
+            for m in messages:
+                new = dict(m)
+                new["llm_verdict"] = {
+                    "bucket": "junk",
+                    "confidence": 0.9,
+                    "reason": "mock",
+                    "route": "auto",
+                }
+                out.append(new)
+            return out
+
+        with patch("triage.OutlookClient", return_value=client):
+            with patch(
+                "triage_llm.classify_messages_with_llm",
+                side_effect=fake_llm,
+            ) as mock_llm:
+                report = triage.classify_inbox(
+                    window_days=30, max_results=10, use_llm=True,
+                    llm_limit=50,
+                )
+
+        # LLM must have been called exactly once.
+        assert mock_llm.call_count == 1
+        # The messages passed must all be bucket=="keep".
+        passed_msgs = mock_llm.call_args.args[0]
+        assert all(m["bucket"] == "keep" for m in passed_msgs)
+        # One keep message in our inbox ⇒ one message sent.
+        assert len(passed_msgs) == 1
+
+        # Keep message should now carry llm_verdict; safe-delete must not.
+        by_id = {m["message_id"]: m for m in report["messages"]}
+        assert by_id["as_msg_2"]["bucket"] == "keep"
+        assert by_id["as_msg_2"]["llm_verdict"]["bucket"] == "junk"
+        assert "llm_verdict" not in by_id["as_msg_1"]
+        # Report-level llm_summary present.
+        assert report["llm_summary"]["verdicts_added"] == 1
+        assert report["llm_summary"]["keep_candidates"] == 1
+
+    def test_llm_flag_absent_skips_llm_entirely(self):
+        """Without --llm, triage_llm must not even be imported-resolved."""
+        import triage  # noqa: WPS433
+
+        inbox = [{
+            "id": "as_msg_1",
+            "sender_email": "x@y.com",
+            "sender_name": "X",
+            "subject": "hello",
+            "received_datetime": datetime.now(),
+            "is_read": False,
+            "body_preview": "",
+            "folder": "Inbox",
+        }]
+        client = self._client_with_inbox(inbox, sent=[])
+        with patch("triage.OutlookClient", return_value=client):
+            with patch(
+                "triage_llm.classify_messages_with_llm",
+            ) as mock_llm:
+                report = triage.classify_inbox(window_days=30, max_results=10)
+        mock_llm.assert_not_called()
+        assert "llm_summary" not in report
