@@ -1095,6 +1095,297 @@ end tell
             elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
         )
 
+    def move_bulk(
+        self,
+        moves: "List[tuple]",
+        *,
+        source_folder: str = "Inbox",
+    ) -> "List[OperationResult]":
+        """Bulk-move primitive — Shape A (B5.2).
+
+        All ``moves`` must share the same ``source_folder``. Each tuple is
+        ``(msg_index, target_folder)``. The implementation:
+
+        1. Pre-fetches each message's state so ``before_state`` and the
+           fingerprint-fallback verify signal are populated.
+        2. Calls ``ensure_folder`` once per unique target (outside the tell
+           block — ``make new mail folder`` is not a safe partner to ``move``
+           inside a single transaction).
+        3. Emits ONE ``tell application "Microsoft Outlook"`` block that
+           captures every message reference BEFORE any move fires. Then
+           issues all moves in sequence inside the same block. This is the
+           property the "Shape A" design relies on — after a move executes
+           the indices shift, but we've already resolved the variable
+           bindings, so the subsequent moves target the right messages.
+        4. After the tell block exits, applies the Bolt 5 (B5.3) settle
+           delay and takes a count-delta check on ``source_folder``. If the
+           count dropped by ``len(moves)``, every move succeeded. If it
+           dropped by less, fall back to per-message fingerprint verify to
+           resolve which ones landed.
+
+        Returns one :class:`OperationResult` per input tuple, same order.
+
+        Notes
+        -----
+        * All results have ``verified`` reflecting whether we have a
+          positive confirmation signal. Count-drop alone yields
+          ``verified=False`` but ``status="success"`` (same semantics as
+          the single-message "UNVERIFIED-success" tier).
+        * If the AppleScript tell block raises, EVERY result is a failure
+          with the same error — we cannot distinguish which of the moves
+          took effect before the error, so treat the whole batch as suspect.
+        * Empty ``moves`` returns an empty list immediately.
+        """
+        start_ms = _time_module.perf_counter()
+        results: List[OperationResult] = []
+
+        if not moves:
+            return results
+
+        # Validate shape — a mixed-type list would corrupt the AppleScript
+        # script. We surface this as individual failures rather than a
+        # library-level exception so caller code doesn't lose rows.
+        normalized: List[tuple] = []
+        for i, item in enumerate(moves):
+            try:
+                idx_raw, target = item
+                normalized.append((int(idx_raw), str(target)))
+            except Exception as e:
+                results.append(OperationResult(
+                    status="failed",
+                    operation="move",
+                    message_id=None,
+                    error_detail=f"invalid moves[{i}] entry: {e!r}",
+                    backend="applescript",
+                    elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                ))
+        if len(normalized) != len(moves):
+            # At least one entry was malformed; bail without touching Outlook.
+            # Fill in a stub failure for the remaining valid ones too so the
+            # returned list length matches the input.
+            for idx, target in normalized:
+                results.append(OperationResult(
+                    status="failed",
+                    operation="move",
+                    message_id=f"as_msg_{idx}",
+                    error_detail="aborted: one or more input entries malformed",
+                    backend="applescript",
+                    elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                ))
+            return results
+
+        source_folder = source_folder or "Inbox"
+        src_ref = self._folder_ref(source_folder)
+
+        # Step 1: per-message pre-fetch so we have before_state + fingerprint.
+        pre_states: List[Dict[str, Any]] = []
+        pre_errors: List[Optional[str]] = []
+        for idx, _target in normalized:
+            try:
+                pre_states.append(self._fetch_message_state(idx, source_folder))
+                pre_errors.append(None)
+            except Exception as e:
+                pre_states.append({})
+                pre_errors.append(f"pre-fetch failed: {e}")
+
+        # Step 2: detect-and-create each unique target folder.
+        unique_targets = sorted({t for _i, t in normalized})
+        ensure_errors: Dict[str, Optional[str]] = {}
+        for tgt in unique_targets:
+            if not tgt or tgt.strip() == "":
+                ensure_errors[tgt] = "target_folder must be a non-empty folder name"
+                continue
+            try:
+                self.ensure_folder(tgt)
+                ensure_errors[tgt] = None
+            except Exception as e:
+                ensure_errors[tgt] = f"ensure_folder({tgt!r}) failed: {e}"
+
+        # Step 3: build a per-row disposition. Rows that couldn't pre-fetch
+        # or whose target ensure failed are NOT included in the tell block —
+        # we return failures for them directly.
+        tell_rows: List[tuple] = []  # (input_index, msg_index, target)
+        for input_i, ((idx, target), pre_err) in enumerate(
+            zip(normalized, pre_errors)
+        ):
+            if pre_err is not None:
+                tell_rows.append((input_i, idx, target, pre_err))
+                continue
+            te = ensure_errors.get(target)
+            if te is not None:
+                tell_rows.append((input_i, idx, target, te))
+                continue
+            tell_rows.append((input_i, idx, target, None))
+
+        active = [r for r in tell_rows if r[3] is None]
+
+        # Step 4: capture source pre-count for the count-delta verify.
+        pre_count = (
+            self._folder_message_count(source_folder)
+            if (self.verify_use_count_check and active)
+            else -1
+        )
+
+        # Step 5: emit the single tell block that captures all refs first
+        # then issues all moves. This is the "Shape A" invariant: variable
+        # bindings resolve before any mutation.
+        script_error: Optional[str] = None
+        if active:
+            lines: List[str] = []
+            lines.append('tell application "Microsoft Outlook"')
+            # Capture refs first (variables m1..mN — ordered per `active`).
+            for i, (_input_i, idx, _tgt, _err) in enumerate(active, 1):
+                lines.append(f"    set m{i} to message {idx} of {src_ref}")
+            # Then fire the moves (same iteration order).
+            for i, (_input_i, _idx, tgt, _err) in enumerate(active, 1):
+                safe_tgt = _escape_applescript(tgt)
+                lines.append(
+                    f'    move m{i} to mail folder "{safe_tgt}" '
+                    f'of (first exchange account)'
+                )
+            lines.append("end tell")
+            script = "\n".join(lines)
+            # AppleScript timeout scales with batch size — allow 5s per move,
+            # minimum 30s floor. Oversized timeouts hurt nothing.
+            timeout = max(30, 5 * len(active))
+            try:
+                _run_applescript(script, timeout=timeout)
+            except Exception as e:
+                script_error = f"applescript bulk move error: {e}"
+
+        # Step 6: settle delay before verify.
+        self._sleep_verify_delay()
+
+        # Step 7: count-delta check — the fast-path verify signal.
+        post_count = (
+            self._folder_message_count(source_folder)
+            if (self.verify_use_count_check and active)
+            else -1
+        )
+        count_check_available = pre_count >= 0 and post_count >= 0
+        active_count = len(active)
+        count_drop = (pre_count - post_count) if count_check_available else -1
+        # Expected: count drops by active_count (a move takes a message out
+        # of the source). If equal, every active row succeeded.
+        all_succeeded = (
+            count_check_available
+            and count_drop == active_count
+            and script_error is None
+        )
+
+        # Step 8: build per-row results.
+        final_results: Dict[int, OperationResult] = {}
+
+        # Pre-failures (pre-fetch + ensure_folder errors) stay as failed.
+        for input_i, idx, target, err in tell_rows:
+            if err is None:
+                continue  # handled below
+            final_results[input_i] = OperationResult(
+                status="failed",
+                operation="move",
+                message_id=f"as_msg_{idx}",
+                verified=False,
+                before_state=pre_states[input_i] if pre_errors[input_i] is None else {},
+                error_detail=err,
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        if script_error is not None:
+            # Whole batch suspect — mark every active row as failed with the
+            # same error. The caller can retry per-message via `move()`.
+            for input_i, idx, target, _err in active:
+                final_results[input_i] = OperationResult(
+                    status="failed",
+                    operation="move",
+                    message_id=f"as_msg_{idx}",
+                    verified=False,
+                    before_state=pre_states[input_i],
+                    error_detail=script_error,
+                    backend="applescript",
+                    elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                )
+        elif all_succeeded:
+            # Fast path — every move landed.
+            for input_i, idx, target, _err in active:
+                before = pre_states[input_i]
+                final_results[input_i] = OperationResult(
+                    status="success",
+                    operation="move",
+                    message_id=f"as_msg_{idx}",
+                    verified=False,  # count-delta only — target-presence not scanned
+                    before_state=before,
+                    after_state={
+                        "folder": target,
+                        "subject": before.get("subject", ""),
+                        "sender_email": before.get("sender_email", ""),
+                    },
+                    error_detail=(
+                        "bulk count-delta confirms move; per-message "
+                        "target-presence not scanned (bulk fast path)"
+                    ),
+                    backend="applescript",
+                    elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                )
+        else:
+            # Partial or unknown — fall back to per-message fingerprint verify.
+            for input_i, idx, target, _err in active:
+                before = pre_states[input_i]
+                still_in_source = self._verify_present_in_folder(
+                    folder_name=source_folder,
+                    subject=before.get("subject", ""),
+                    sender_email=before.get("sender_email", ""),
+                    scan_limit=200,
+                )
+                present_in_target = self._verify_present_in_folder(
+                    folder_name=target,
+                    subject=before.get("subject", ""),
+                    sender_email=before.get("sender_email", ""),
+                    scan_limit=500,
+                )
+                move_succeeded = (not still_in_source)
+                verified = move_succeeded and present_in_target
+                if move_succeeded:
+                    final_results[input_i] = OperationResult(
+                        status="success",
+                        operation="move",
+                        message_id=f"as_msg_{idx}",
+                        verified=verified,
+                        before_state=before,
+                        after_state={
+                            "folder": target,
+                            "subject": before.get("subject", ""),
+                            "sender_email": before.get("sender_email", ""),
+                        },
+                        error_detail=None if verified else (
+                            "source-absence confirms move; target-presence unconfirmed"
+                        ),
+                        backend="applescript",
+                        elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                    )
+                else:
+                    final_results[input_i] = OperationResult(
+                        status="failed",
+                        operation="move",
+                        message_id=f"as_msg_{idx}",
+                        verified=False,
+                        before_state=before,
+                        error_detail=(
+                            f"bulk partial: message still in {source_folder!r} "
+                            f"after batch (count-delta={count_drop}, "
+                            f"expected {active_count})"
+                        ),
+                        backend="applescript",
+                        elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                    )
+
+        # Append the per-input-index already-recorded pre-failures too — our
+        # ``results`` list is empty at this point because we bailed early
+        # ONLY when input was malformed (which short-circuits before here).
+        for input_i in range(len(normalized)):
+            results.append(final_results[input_i])
+        return results
+
     def _sleep_verify_delay(self) -> None:
         """Sleep for ``verify_delay_ms`` to let Exchange→client sync settle.
 
@@ -1722,6 +2013,94 @@ class OutlookClient:
         if self.backend == "graph":
             return self._move_graph(message_id, target_folder)
         raise RuntimeError(f"Unknown backend: {self.backend}")
+
+    def move_bulk(
+        self,
+        moves: List[tuple],
+        *,
+        source_folder: Optional[str] = None,
+    ) -> List[OperationResult]:
+        """Bulk-move (Bolt 5 / B5.2).
+
+        Accepts ``moves`` as a list of ``(message_id, target_folder)`` tuples
+        that ALL share the same ``source_folder``. Returns one
+        :class:`OperationResult` per input, same order.
+
+        Dispatch
+        --------
+        * AppleScript: routed to :meth:`_AppleScriptBackend.move_bulk` which
+          issues one tell block capturing every message ref before any move
+          fires. This defeats the index-shift and sync-lag failure modes.
+        * COM, Graph: no bulk primitive yet (Bolt 5 scoped AppleScript only).
+          Falls back to a per-message loop over :meth:`move` for parity.
+        """
+        if self.backend == "applescript":
+            as_moves: List[tuple] = []
+            for message_id, target_folder in moves:
+                idx = _parse_as_msg_index(message_id)
+                as_moves.append((idx, target_folder))
+            return self._applescript.move_bulk(
+                as_moves,
+                source_folder=source_folder or "Inbox",
+            )
+        # Fallback — serial loop. Preserves return shape.
+        return [
+            self.move(mid, tgt, source_folder=source_folder)
+            for mid, tgt in moves
+        ]
+
+    def delete_bulk(
+        self,
+        message_ids: List[str],
+        *,
+        permanent: bool = False,
+        yes_really_permanent: bool = False,
+        folder_name: Optional[str] = None,
+    ) -> List[OperationResult]:
+        """Bulk-delete (Bolt 5 / B5.2).
+
+        Soft-delete routes through :meth:`move_bulk` with target
+        ``"Deleted Items"`` — same primitive, same guarantees. Hard-delete
+        is intentionally NOT bulk-ified in Bolt 5 — hard-delete remains a
+        per-message, double-flag operation (panel F6).
+
+        ``operation`` on every returned OperationResult is rewritten to
+        ``"delete"`` so the caller sees intent, not internal mechanics.
+        """
+        if permanent:
+            if not yes_really_permanent:
+                raise ValueError(
+                    "Refusing to hard-delete: permanent=True requires "
+                    "yes_really_permanent=True. Hard-delete is per-message "
+                    "only — use delete() in a loop."
+                )
+            # Serial fallback for hard-delete; Bolt 5 keeps bulk soft only.
+            return [
+                self.delete(
+                    mid, permanent=True,
+                    yes_really_permanent=True,
+                    folder_name=folder_name,
+                )
+                for mid in message_ids
+            ]
+
+        moves = [(mid, "Deleted Items") for mid in message_ids]
+        results = self.move_bulk(moves, source_folder=folder_name)
+        # Rewrite operation to "delete" so callers get the intent back.
+        out: List[OperationResult] = []
+        for r in results:
+            out.append(OperationResult(
+                status=r.status,
+                operation="delete",
+                message_id=r.message_id,
+                verified=r.verified,
+                before_state=r.before_state,
+                after_state={**r.after_state, "permanent": False},
+                error_detail=r.error_detail,
+                backend=r.backend,
+                elapsed_ms=r.elapsed_ms,
+            ))
+        return out
 
     def delete(
         self,
