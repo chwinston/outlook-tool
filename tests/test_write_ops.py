@@ -230,12 +230,23 @@ class TestAppleScriptMarkRead:
 
 
 class TestAppleScriptMove:
-    def test_success_with_fingerprint_hit(self):
+    def test_success_with_both_source_absence_and_target_presence(self):
+        # Verify is called twice: source-check first (returns False = not
+        # present = move succeeded), then target-check (returns True = found
+        # in Archive = fully verified).
         backend = _make_applescript_backend()
         before = {"folder": "Inbox", "is_read": False, "subject": "Report", "sender_email": "jane@e.com"}
+
+        def verify_side_effect(folder_name, subject, sender_email, scan_limit):
+            if folder_name == "Inbox":
+                return False  # not in source → move succeeded
+            if folder_name == "Archive":
+                return True  # confirmed in target
+            raise AssertionError(f"unexpected folder {folder_name!r}")
+
         with patch.object(backend, "_fetch_message_state", return_value=before), \
              patch.object(backend, "ensure_folder"), \
-             patch.object(backend, "_verify_present_in_folder", return_value=True), \
+             patch.object(backend, "_verify_present_in_folder", side_effect=verify_side_effect), \
              patch("outlook_tool._run_applescript", return_value=""):
             r = backend.move(msg_index=1, target_folder="Archive", source_folder="Inbox")
         assert r.status == "success"
@@ -244,17 +255,47 @@ class TestAppleScriptMove:
         assert r.after_state["folder"] == "Archive"
         assert r.before_state["folder"] == "Inbox"
 
-    def test_silent_success_when_not_in_target(self):
+    def test_unverified_success_when_target_scan_misses(self):
+        # Large-mailbox case: move succeeded (gone from source) but target-side
+        # fingerprint scan misses (e.g. Deleted Items has 5000+ messages).
+        # Should return success, verified=False — the UNVERIFIED-success tier.
         backend = _make_applescript_backend()
         before = {"folder": "Inbox", "is_read": False, "subject": "Report", "sender_email": "jane@e.com"}
+
+        def verify_side_effect(folder_name, subject, sender_email, scan_limit):
+            if folder_name == "Inbox":
+                return False  # not in source
+            return False  # scan missed in target
+
         with patch.object(backend, "_fetch_message_state", return_value=before), \
              patch.object(backend, "ensure_folder"), \
-             patch.object(backend, "_verify_present_in_folder", return_value=False), \
+             patch.object(backend, "_verify_present_in_folder", side_effect=verify_side_effect), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            r = backend.move(msg_index=1, target_folder="Archive", source_folder="Inbox")
+        assert r.status == "success"
+        assert r.verified is False
+        assert "source-absence confirms" in (r.error_detail or "")
+
+    def test_silent_success_when_message_still_in_source(self):
+        # Real silent-success: AppleScript returned OK but message is still
+        # in source folder → the move didn't take effect.
+        backend = _make_applescript_backend()
+        before = {"folder": "Inbox", "is_read": False, "subject": "Report", "sender_email": "jane@e.com"}
+
+        def verify_side_effect(folder_name, subject, sender_email, scan_limit):
+            if folder_name == "Inbox":
+                return True  # still there → move failed
+            return False
+
+        with patch.object(backend, "_fetch_message_state", return_value=before), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_verify_present_in_folder", side_effect=verify_side_effect), \
              patch("outlook_tool._run_applescript", return_value=""):
             r = backend.move(msg_index=1, target_folder="Archive", source_folder="Inbox")
         assert r.status == "failed"
         assert r.verified is False
         assert "silent-success" in (r.error_detail or "")
+        assert "still in" in (r.error_detail or "")
 
     def test_empty_target_folder_rejected(self):
         backend = _make_applescript_backend()

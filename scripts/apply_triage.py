@@ -125,9 +125,14 @@ def render_preview(
     *,
     bucket: str,
     report_path: Path,
+    exclude_ids: Optional[set] = None,
 ) -> str:
     """Build the Markdown preview the operator reads before saying 'apply'."""
-    messages = [m for m in report.get("messages", []) if m.get("bucket") == bucket]
+    exclude = exclude_ids or set()
+    messages = [
+        m for m in report.get("messages", [])
+        if m.get("bucket") == bucket and m.get("message_id") not in exclude
+    ]
     generated_at = report.get("generated_at", "unknown")
     age_seconds = report.get("_age_seconds", 0)
     age_minutes = int(age_seconds / 60)
@@ -336,12 +341,17 @@ def apply_bucket(
     bucket: str,
     source_folder: str = "Inbox",
     progress: bool = True,
+    exclude_ids: Optional[set] = None,
 ) -> ApplyOutcome:
     """Run the appropriate action on every message in ``bucket``.
 
     ``safe-delete`` → soft-delete via :meth:`OutlookClient.delete`.
     ``resolved-ticket`` / ``low-signal-client`` → move into ``Archive``.
     Preview-only buckets (needs-action, keep) short-circuit cleanly.
+
+    ``exclude_ids`` — optional set of ``message_id`` values to skip. Used by
+    the human-reviewed walk-through to preserve rows flagged for keep even
+    though the classifier bucketed them.
     """
     action = BUCKET_ACTIONS.get(bucket)
     outcome = ApplyOutcome()
@@ -352,10 +362,19 @@ def apply_bucket(
         )
         return outcome
 
-    messages = [m for m in report.get("messages", []) if m.get("bucket") == bucket]
+    exclude = exclude_ids or set()
+    messages = [
+        m for m in report.get("messages", [])
+        if m.get("bucket") == bucket and m.get("message_id") not in exclude
+    ]
     if not messages:
         print(f"No messages in bucket {bucket!r}.", file=sys.stderr)
         return outcome
+    if exclude:
+        print(
+            f"Excluding {len(exclude)} message id(s) per --exclude-ids.",
+            file=sys.stderr,
+        )
 
     for i, m in enumerate(messages, 1):
         if progress:
@@ -461,6 +480,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write the preview / apply summary to PATH in addition to stdout.",
     )
     parser.add_argument(
+        "--exclude-ids", default="",
+        help=(
+            "Comma-separated list of message_ids to skip (e.g. "
+            "'as_msg_62,as_msg_104'). Used after a human walk-through "
+            "to preserve classifier-bucketed messages that the operator "
+            "wants to keep. Applies to both preview and --apply."
+        ),
+    )
+    parser.add_argument(
         "--yes-really-permanent", action="store_true",
         help=argparse.SUPPRESS,  # Documented NO. Catch & refuse.
     )
@@ -495,8 +523,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 2
 
-    preview = render_preview(report, bucket=args.bucket, report_path=report_path)
+    exclude_ids = {
+        s.strip() for s in (args.exclude_ids or "").split(",") if s.strip()
+    }
+    preview = render_preview(
+        report, bucket=args.bucket, report_path=report_path,
+        exclude_ids=exclude_ids,
+    )
     print(preview)
+    if exclude_ids:
+        print(
+            f"\n(Excluding {len(exclude_ids)} message_id(s) from the apply: "
+            f"{', '.join(sorted(exclude_ids))})",
+            file=sys.stderr,
+        )
 
     if not args.apply:
         print(
@@ -527,6 +567,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         client, report,
         bucket=args.bucket,
         source_folder=args.source_folder,
+        exclude_ids=exclude_ids,
     )
     summary = render_apply_summary(outcome, bucket=args.bucket, action=action)
     print(summary)

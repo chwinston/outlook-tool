@@ -956,31 +956,70 @@ end tell
                 elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
             )
 
-        # Round-trip verify by fingerprint in target folder (Tim F1).
+        # Round-trip verify (Tim F1) uses TWO signals:
+        # (1) source-absence: is the message still in the source folder? If
+        #     no, the move clearly succeeded (this is the strong signal on
+        #     large mailboxes where target-folder scans can't cover all rows).
+        # (2) target-presence by fingerprint, scan_limit=500 to tolerate large
+        #     Deleted Items / Archive folders.
         target_subject = before.get("subject", "")
         target_sender = before.get("sender_email", "")
-        verified = self._verify_present_in_folder(
+
+        still_in_source = self._verify_present_in_folder(
+            folder_name=source_folder,
+            subject=target_subject,
+            sender_email=target_sender,
+            scan_limit=200,
+        )
+        present_in_target = self._verify_present_in_folder(
             folder_name=target_folder,
             subject=target_subject,
             sender_email=target_sender,
-            scan_limit=50,
+            scan_limit=500,
         )
+
+        # The move succeeded if the message is GONE from source. Target-side
+        # presence is secondary — large Deleted Items can hide the row past
+        # the scan limit.
+        move_succeeded = not still_in_source
+        verified = move_succeeded and present_in_target
 
         after: Dict[str, Any] = {
             "folder": target_folder,
             "subject": target_subject,
             "sender_email": target_sender,
         }
+
+        if move_succeeded:
+            # The write worked. verified distinguishes strong-confirmed vs
+            # source-absence-only (Phase 1's UNVERIFIED-success tier).
+            return OperationResult(
+                status="success",
+                operation=operation,
+                message_id=message_id,
+                verified=verified,
+                before_state=before,
+                after_state=after,
+                error_detail=None if verified else (
+                    f"source-absence confirms move; target-presence unconfirmed "
+                    f"(scanned first 500 of {target_folder!r})"
+                ),
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Source still has the message → the AppleScript move actually
+        # didn't take effect. This is the real silent-success case.
         return OperationResult(
-            status="success" if verified else "failed",
+            status="failed",
             operation=operation,
             message_id=message_id,
-            verified=verified,
+            verified=False,
             before_state=before,
             after_state=after,
-            error_detail=None if verified else (
-                f"post-move verify did not find message in {target_folder!r} "
-                "(possible silent-success)"
+            error_detail=(
+                f"silent-success: AppleScript returned OK but message is "
+                f"still in {source_folder!r}"
             ),
             backend="applescript",
             elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
@@ -1142,7 +1181,7 @@ end tell
             folder_name=source_folder,
             subject=before.get("subject", ""),
             sender_email=before.get("sender_email", ""),
-            scan_limit=50,
+            scan_limit=500,
         )
         verified = not still_there
         return OperationResult(
