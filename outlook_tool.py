@@ -44,10 +44,86 @@ import hashlib
 import os
 import re
 import sys
+import time as _time_module
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote as _url_quote
+
+
+# =============================================================================
+# OPERATION RESULT (Bolt 4 — write verbs contract)
+# =============================================================================
+
+@dataclass
+class OperationResult:
+    """Unified return contract for write operations across every backend.
+
+    Produced by :meth:`OutlookClient.move`, :meth:`OutlookClient.delete`,
+    :meth:`OutlookClient.mark_read` and the backend implementations they
+    dispatch to.
+
+    Fields
+    ------
+    status:
+        One of ``"success"``, ``"failed"``, ``"unsupported"``, ``"dry_run"``.
+        ``success`` means the op was attempted and returned without an error;
+        callers MUST also check ``verified`` before trusting the state change.
+        ``unsupported`` is reserved for cases the backend cannot execute —
+        e.g. Graph without ``Mail.ReadWrite`` scope.
+    verified:
+        ``True`` only when a post-op re-fetch confirms the target state.
+        This defends against the AppleScript silent-success failure mode where
+        the op returns no error but Outlook refused the change (Tim F1).
+    message_id:
+        Backend-scoped identifier of the message that was operated on.
+    operation:
+        The verb executed: ``"move"``, ``"delete"`` or ``"mark_read"``.
+    before_state:
+        Snapshot of the salient fields before the op (e.g. ``{"folder": "Inbox",
+        "is_read": False}``). Used to verify no-op safety and for audit logs.
+    after_state:
+        Snapshot of the salient fields after the op, when the backend could
+        re-fetch successfully.
+    error_detail:
+        Human-readable detail when ``status`` is ``failed`` or ``unsupported``.
+    backend:
+        Which backend handled the op — ``"applescript"``, ``"win32com"`` or
+        ``"graph"`` — so callers can reason about provenance.
+    elapsed_ms:
+        Wall-clock duration of the call in milliseconds. Useful for the
+        batching decision Phase 3 will make later.
+    """
+
+    status: str  # "success" | "failed" | "unsupported" | "dry_run"
+    operation: str  # "move" | "delete" | "mark_read"
+    message_id: Optional[str] = None
+    verified: bool = False
+    before_state: Dict[str, Any] = field(default_factory=dict)
+    after_state: Dict[str, Any] = field(default_factory=dict)
+    error_detail: Optional[str] = None
+    backend: Optional[str] = None
+    elapsed_ms: Optional[int] = None
+
+    _VALID_STATUSES = frozenset({"success", "failed", "unsupported", "dry_run"})
+    _VALID_OPERATIONS = frozenset({"move", "delete", "mark_read"})
+
+    def __post_init__(self) -> None:
+        if self.status not in self._VALID_STATUSES:
+            raise ValueError(
+                f"Invalid OperationResult.status={self.status!r}; "
+                f"must be one of {sorted(self._VALID_STATUSES)}"
+            )
+        if self.operation not in self._VALID_OPERATIONS:
+            raise ValueError(
+                f"Invalid OperationResult.operation={self.operation!r}; "
+                f"must be one of {sorted(self._VALID_OPERATIONS)}"
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to a plain dict (JSON-safe for CLI output)."""
+        return asdict(self)
 
 # =============================================================================
 # PLATFORM DETECTION
@@ -579,6 +655,631 @@ end tell
 
         return results
 
+    # =========================================================================
+    # WRITE OPERATIONS (Bolt 4) — mark_read / move / delete
+    # =========================================================================
+    #
+    # Round-trip verify is mandatory on every write. The dominant AppleScript
+    # risk is silent-success (Tim F1): the op returns 0 bytes to stderr but
+    # Outlook didn't actually perform the change. Every public write method
+    # below re-queries the message after the op and sets
+    # ``OperationResult.verified`` only when the observed post-state matches
+    # the intent.
+    #
+    # NOTE FOR PHASE 2: AppleScript message indices are session-scoped. A
+    # triage report produced via ``scan_emails`` and acted on more than a
+    # few minutes later may encounter stale indices (Outlook re-sorted the
+    # folder, user deleted something, etc.). The executor in Phase 2 MUST
+    # refuse reports > 1h old and SHOULD fall back to (sender, subject,
+    # received_date) identity if the raw index misses.
+
+    @staticmethod
+    def _folder_ref(folder_name: Optional[str]) -> str:
+        """Return the AppleScript expression resolving to the right mail folder.
+
+        Inbox is a special-cased convenience; anything else goes through the
+        first exchange account.
+        """
+        if not folder_name or folder_name.lower() == "inbox":
+            return "inbox"
+        safe = _escape_applescript(folder_name)
+        return f'mail folder "{safe}" of (first exchange account)'
+
+    def _fetch_message_state(
+        self, msg_index: int, folder_name: Optional[str]
+    ) -> Dict[str, Any]:
+        """Re-fetch a message's salient state for round-trip verification.
+
+        Returns a dict with ``folder``, ``is_read``, ``subject``, ``sender_email``.
+        Raises ``RuntimeError`` if the message cannot be found in ``folder_name``
+        (used by move/delete verify to confirm the message actually left).
+        """
+        msg_index = int(msg_index)
+        safe_folder = json.dumps(folder_name) if folder_name else "null"
+        script = f"""
+        (function() {{
+            var outlook = Application("Microsoft Outlook");
+            var folderName = {safe_folder};
+            var folder;
+            if (!folderName || folderName.toLowerCase() === "inbox") {{
+                folder = outlook.inbox;
+            }} else {{
+                var accts = outlook.exchangeAccounts();
+                if (accts.length === 0) return JSON.stringify({{error: "no_account"}});
+                var allFolders = accts[0].mailFolders();
+                for (var fi = 0; fi < allFolders.length; fi++) {{
+                    try {{
+                        if (allFolders[fi].name() === folderName) {{
+                            folder = allFolders[fi];
+                            break;
+                        }}
+                    }} catch(e) {{}}
+                }}
+                if (!folder) return JSON.stringify({{error: "folder_not_found"}});
+            }}
+            try {{
+                var m = folder.messages[{msg_index - 1}];
+                var subj = ""; try {{ subj = m.subject() || ""; }} catch(e) {{}}
+                var isRead = false; try {{ isRead = m.isRead(); }} catch(e) {{}}
+                var addr = ""; try {{ addr = m.sender().address || ""; }} catch(e) {{}}
+                return JSON.stringify({{subject: subj, is_read: isRead, sender_email: addr}});
+            }} catch(e) {{
+                return JSON.stringify({{error: "message_not_found"}});
+            }}
+        }})();
+        """
+        raw = _run_jxa(script, timeout=60)
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            raise RuntimeError(f"_fetch_message_state: bad JSON: {e}")
+        if isinstance(data, dict) and "error" in data:
+            raise RuntimeError(
+                f"Message index {msg_index} not resolvable in folder "
+                f"{folder_name or 'Inbox'!r}: {data['error']}"
+            )
+        return {
+            "folder": folder_name or "Inbox",
+            "is_read": bool(data.get("is_read", False)),
+            "subject": data.get("subject", ""),
+            "sender_email": data.get("sender_email", ""),
+        }
+
+    def mark_read(
+        self,
+        msg_index: int,
+        folder_name: Optional[str] = None,
+        read: bool = True,
+    ) -> OperationResult:
+        """Set the read/unread flag on a message and verify.
+
+        Args:
+            msg_index: AppleScript message index inside ``folder_name``.
+                Comes from a ``scan_emails`` result's ``_as_msg_index``.
+            folder_name: Folder the message lives in. ``None``/``"Inbox"``
+                targets the default Inbox.
+            read: ``True`` to mark read, ``False`` to mark unread.
+
+        Returns:
+            ``OperationResult`` with ``verified=True`` iff the post-op state
+            matches the requested ``read`` value.
+        """
+        start_ms = _time_module.perf_counter()
+        msg_index = int(msg_index)
+        folder_ref = self._folder_ref(folder_name)
+        operation = "mark_read"
+        message_id = f"as_msg_{msg_index}"
+
+        try:
+            before = self._fetch_message_state(msg_index, folder_name)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                error_detail=f"pre-fetch failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        target_bool = "true" if read else "false"
+        script = f'''
+tell application "Microsoft Outlook"
+    set m to message {msg_index} of {folder_ref}
+    set read status of m to {target_bool}
+end tell
+'''
+        try:
+            _run_applescript(script)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"applescript error: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Round-trip verify.
+        try:
+            after = self._fetch_message_state(msg_index, folder_name)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"post-verify fetch failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        verified = after["is_read"] == bool(read)
+        return OperationResult(
+            status="success" if verified else "failed",
+            operation=operation,
+            message_id=message_id,
+            verified=verified,
+            before_state=before,
+            after_state=after,
+            error_detail=None if verified else "post-state did not match request (silent success?)",
+            backend="applescript",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _folder_exists(self, folder_name: str) -> bool:
+        """Does a top-level mail folder with this exact name exist?"""
+        safe = _escape_applescript(folder_name)
+        script = f'''
+tell application "Microsoft Outlook"
+    try
+        set f to mail folder "{safe}" of (first exchange account)
+        return "yes"
+    on error
+        return "no"
+    end try
+end tell
+'''
+        return _run_applescript(script).strip() == "yes"
+
+    def ensure_folder(self, folder_name: str) -> None:
+        """Detect-and-create a top-level mail folder on the primary account.
+
+        No-op if the folder already exists. Raises ``RuntimeError`` on failure.
+        """
+        if not folder_name or folder_name.lower() == "inbox":
+            return  # inbox is always present
+        if self._folder_exists(folder_name):
+            return
+        safe = _escape_applescript(folder_name)
+        script = f'''
+tell application "Microsoft Outlook"
+    set acct to first exchange account
+    make new mail folder at acct with properties {{name:"{safe}"}}
+end tell
+'''
+        _run_applescript(script)
+        if not self._folder_exists(folder_name):
+            raise RuntimeError(
+                f"ensure_folder: creation of {folder_name!r} did not take effect"
+            )
+
+    def move(
+        self,
+        msg_index: int,
+        target_folder: str,
+        source_folder: Optional[str] = None,
+    ) -> OperationResult:
+        """Move a message from ``source_folder`` to ``target_folder``.
+
+        Creates ``target_folder`` on the primary Exchange account if it doesn't
+        yet exist (detect-and-create — Al F3). Round-trip verify re-queries the
+        TARGET folder to confirm the message actually arrived (Tim F1 —
+        silent-success defence).
+
+        Note on verification: we re-query the target folder by scanning the last
+        50 messages for a matching ``(subject, sender_email)`` fingerprint. This
+        is more robust than trusting the post-move index would stay valid, since
+        AppleScript indices reorder after a move.
+
+        Args:
+            msg_index: AppleScript index in the source folder.
+            target_folder: Destination folder name. Created if missing.
+            source_folder: Where the message lives now. ``None`` = Inbox.
+
+        Returns:
+            ``OperationResult`` with ``verified=True`` only when a fingerprint
+            match is found in ``target_folder`` within the last 50 messages.
+        """
+        start_ms = _time_module.perf_counter()
+        msg_index = int(msg_index)
+        operation = "move"
+        message_id = f"as_msg_{msg_index}"
+        source_folder = source_folder or "Inbox"
+        src_ref = self._folder_ref(source_folder)
+
+        if not target_folder or target_folder.strip() == "":
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                error_detail="target_folder must be a non-empty folder name",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        try:
+            before = self._fetch_message_state(msg_index, source_folder)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                error_detail=f"pre-fetch failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Detect-and-create target folder (Al F3).
+        try:
+            self.ensure_folder(target_folder)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"ensure_folder({target_folder!r}) failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        safe_target = _escape_applescript(target_folder)
+        script = f'''
+tell application "Microsoft Outlook"
+    set m to message {msg_index} of {src_ref}
+    move m to mail folder "{safe_target}" of (first exchange account)
+end tell
+'''
+        try:
+            _run_applescript(script)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"applescript error: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Round-trip verify (Tim F1) uses TWO signals:
+        # (1) source-absence: is the message still in the source folder? If
+        #     no, the move clearly succeeded (this is the strong signal on
+        #     large mailboxes where target-folder scans can't cover all rows).
+        # (2) target-presence by fingerprint, scan_limit=500 to tolerate large
+        #     Deleted Items / Archive folders.
+        target_subject = before.get("subject", "")
+        target_sender = before.get("sender_email", "")
+
+        still_in_source = self._verify_present_in_folder(
+            folder_name=source_folder,
+            subject=target_subject,
+            sender_email=target_sender,
+            scan_limit=200,
+        )
+        present_in_target = self._verify_present_in_folder(
+            folder_name=target_folder,
+            subject=target_subject,
+            sender_email=target_sender,
+            scan_limit=500,
+        )
+
+        # The move succeeded if the message is GONE from source. Target-side
+        # presence is secondary — large Deleted Items can hide the row past
+        # the scan limit.
+        move_succeeded = not still_in_source
+        verified = move_succeeded and present_in_target
+
+        after: Dict[str, Any] = {
+            "folder": target_folder,
+            "subject": target_subject,
+            "sender_email": target_sender,
+        }
+
+        if move_succeeded:
+            # The write worked. verified distinguishes strong-confirmed vs
+            # source-absence-only (Phase 1's UNVERIFIED-success tier).
+            return OperationResult(
+                status="success",
+                operation=operation,
+                message_id=message_id,
+                verified=verified,
+                before_state=before,
+                after_state=after,
+                error_detail=None if verified else (
+                    f"source-absence confirms move; target-presence unconfirmed "
+                    f"(scanned first 500 of {target_folder!r})"
+                ),
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Source still has the message → the AppleScript move actually
+        # didn't take effect. This is the real silent-success case.
+        return OperationResult(
+            status="failed",
+            operation=operation,
+            message_id=message_id,
+            verified=False,
+            before_state=before,
+            after_state=after,
+            error_detail=(
+                f"silent-success: AppleScript returned OK but message is "
+                f"still in {source_folder!r}"
+            ),
+            backend="applescript",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _verify_present_in_folder(
+        self,
+        folder_name: str,
+        subject: str,
+        sender_email: str,
+        scan_limit: int = 50,
+    ) -> bool:
+        """Scan the top ``scan_limit`` messages of ``folder_name`` for a match.
+
+        Returns True if any message's ``(subject, sender_email)`` matches.
+        ``sender_email`` comparison is case-insensitive and tolerates the
+        empty string (some drafts and in-house messages lack a resolvable
+        SMTP sender on AppleScript).
+        """
+        folder_ref = self._folder_ref(folder_name)
+        # Build a JXA-side fetch so we can compare in Python and avoid the
+        # AppleScript/tell-block handler scoping quirks.
+        safe_folder = json.dumps(folder_name)
+        script = f"""
+        (function() {{
+            var outlook = Application("Microsoft Outlook");
+            var folderName = {safe_folder};
+            var folder;
+            if (!folderName || folderName.toLowerCase() === "inbox") {{
+                folder = outlook.inbox;
+            }} else {{
+                var accts = outlook.exchangeAccounts();
+                if (accts.length === 0) return JSON.stringify([]);
+                var allFolders = accts[0].mailFolders();
+                for (var fi = 0; fi < allFolders.length; fi++) {{
+                    try {{
+                        if (allFolders[fi].name() === folderName) {{
+                            folder = allFolders[fi];
+                            break;
+                        }}
+                    }} catch(e) {{}}
+                }}
+                if (!folder) return JSON.stringify([]);
+            }}
+            var msgCount = folder.messages.length;
+            var limit = Math.min(msgCount, {int(scan_limit)});
+            var out = [];
+            for (var i = 0; i < limit; i++) {{
+                try {{
+                    var m = folder.messages[i];
+                    var subj = "";
+                    try {{ subj = m.subject() || ""; }} catch(e) {{}}
+                    var addr = "";
+                    try {{ addr = m.sender().address || ""; }} catch(e) {{}}
+                    out.push({{subject: subj, sender: addr}});
+                }} catch(e) {{}}
+            }}
+            return JSON.stringify(out);
+        }})();
+        """
+        raw = _run_jxa(script, timeout=60)
+        try:
+            entries = json.loads(raw or "[]")
+        except Exception:
+            return False
+        target_subject = subject or ""
+        target_sender = (sender_email or "").lower()
+        for entry in entries:
+            if entry.get("subject", "") != target_subject:
+                continue
+            if not target_sender:
+                return True
+            if (entry.get("sender", "") or "").lower() == target_sender:
+                return True
+        return False
+
+    def delete_message(
+        self,
+        msg_index: int,
+        folder_name: Optional[str] = None,
+        permanent: bool = False,
+    ) -> OperationResult:
+        """Delete a message — soft-delete (move to Deleted Items) by default.
+
+        Args:
+            msg_index: AppleScript index in ``folder_name``.
+            folder_name: Source folder. ``None`` = Inbox.
+            permanent: If True, hard-delete (remove without trash). The
+                public ``OutlookClient.delete`` enforces the extra
+                ``yes_really_permanent`` gate on top of this flag.
+
+        Returns:
+            ``OperationResult``. For soft-delete, verified=True when the
+            message appears in Deleted Items. For hard-delete, verified=True
+            when the message is no longer present in the source folder.
+        """
+        start_ms = _time_module.perf_counter()
+        msg_index = int(msg_index)
+        operation = "delete"
+        message_id = f"as_msg_{msg_index}"
+        source_folder = folder_name or "Inbox"
+
+        if not permanent:
+            # Soft-delete is just a move into Deleted Items. Use the move path
+            # so verification semantics (fingerprint hit in destination) match.
+            result = self.move(
+                msg_index=msg_index,
+                target_folder="Deleted Items",
+                source_folder=source_folder,
+            )
+            # Rewrite op to reflect intent — move internally, delete externally.
+            return OperationResult(
+                status=result.status,
+                operation=operation,
+                message_id=result.message_id,
+                verified=result.verified,
+                before_state=result.before_state,
+                after_state={**result.after_state, "permanent": False},
+                error_detail=result.error_detail,
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Permanent delete path.
+        src_ref = self._folder_ref(source_folder)
+        try:
+            before = self._fetch_message_state(msg_index, source_folder)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                error_detail=f"pre-fetch failed: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        script = f'''
+tell application "Microsoft Outlook"
+    set m to message {msg_index} of {src_ref}
+    delete m
+end tell
+'''
+        try:
+            _run_applescript(script)
+        except Exception as e:
+            return OperationResult(
+                status="failed",
+                operation=operation,
+                message_id=message_id,
+                before_state=before,
+                error_detail=f"applescript error: {e}",
+                backend="applescript",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+        # Verify: message should NOT be present in source folder by fingerprint.
+        still_there = self._verify_present_in_folder(
+            folder_name=source_folder,
+            subject=before.get("subject", ""),
+            sender_email=before.get("sender_email", ""),
+            scan_limit=500,
+        )
+        verified = not still_there
+        return OperationResult(
+            status="success" if verified else "failed",
+            operation=operation,
+            message_id=message_id,
+            verified=verified,
+            before_state=before,
+            after_state={"folder": None, "permanent": True},
+            error_detail=None if verified else (
+                "post-delete verify: message still present in source folder"
+            ),
+            backend="applescript",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    # ------------------------------------------------------------------
+    # Test harness helpers (used by tests/test_write_ops.py only)
+    # ------------------------------------------------------------------
+
+    def delete_folder_if_empty(self, folder_name: str) -> bool:
+        """Delete ``folder_name`` on the primary account iff it is empty.
+
+        Returns True if the folder was deleted, False otherwise. Never raises
+        for a missing folder.
+        """
+        if not folder_name or folder_name.lower() == "inbox":
+            return False
+        if not self._folder_exists(folder_name):
+            return False
+        safe = _escape_applescript(folder_name)
+        script = f'''
+tell application "Microsoft Outlook"
+    set f to mail folder "{safe}" of (first exchange account)
+    if (count of messages of f) is 0 then
+        delete f
+        return "deleted"
+    else
+        return "not_empty"
+    end if
+end tell
+'''
+        return _run_applescript(script).strip() == "deleted"
+
+    def seed_draft_in_folder(
+        self,
+        folder_name: str,
+        subject: str,
+        body: str,
+    ) -> Dict[str, Any]:
+        """Create a draft message directly inside ``folder_name`` and return
+        its state fingerprint + a newly-fetched AppleScript index.
+
+        The draft is created, moved into the folder, and then re-queried so
+        tests get the ``_as_msg_index`` they need to exercise write verbs.
+        """
+        self.ensure_folder(folder_name)
+        safe_subject = _escape_applescript(subject)
+        safe_body = _escape_applescript(body)
+        safe_folder = _escape_applescript(folder_name)
+        script = f'''
+tell application "Microsoft Outlook"
+    set draftMsg to make new outgoing message with properties {{subject:"{safe_subject}", plain text content:"{safe_body}"}}
+    move draftMsg to mail folder "{safe_folder}" of (first exchange account)
+end tell
+'''
+        _run_applescript(script)
+        # Find the just-created message by subject.
+        folder_ref = self._folder_ref(folder_name)
+        find_script = f'''
+tell application "Microsoft Outlook"
+    set f to {folder_ref}
+    set msgCount to count of messages of f
+    set i to 1
+    repeat while i <= msgCount and i <= 50
+        try
+            set m to message i of f
+            if subject of m is equal to "{safe_subject}" then
+                return i as text
+            end if
+        end try
+        set i to i + 1
+    end repeat
+    return "not_found"
+end tell
+'''
+        idx_raw = _run_applescript(find_script).strip()
+        if idx_raw == "not_found":
+            raise RuntimeError(
+                f"seed_draft_in_folder: could not locate seeded message "
+                f"{subject!r} in {folder_name!r}"
+            )
+        return {
+            "msg_index": int(idx_raw),
+            "folder_name": folder_name,
+            "subject": subject,
+        }
+
 
 # =============================================================================
 # GRAPH API BACKEND
@@ -587,6 +1288,7 @@ end tell
 GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPES_READ = ["Mail.Read"]
 GRAPH_SCOPES_SEND = ["Mail.Read", "Mail.Send"]
+GRAPH_SCOPES_READWRITE = ["Mail.ReadWrite"]
 TOKEN_CACHE_PATH = Path.home() / ".outlook_tool_token_cache.bin"
 
 # Microsoft Office desktop app — public client ID, no registration needed.
@@ -732,6 +1434,31 @@ class _GraphBackend:
                 token_cache=self._cache,
             )
 
+    # ------------------------------------------------------------------
+    # Granted-scope detection (Bolt 4)
+    # ------------------------------------------------------------------
+    #
+    # CRITICAL: Phase 1 does not auto-upgrade write scopes. The scope cliff
+    # is surfaced as status="unsupported" so callers know the backend
+    # literally cannot do the write — distinct from a 403 at runtime where
+    # the scope is granted but a specific operation was refused.
+
+    def has_write_scope(self) -> bool:
+        """Return True iff the current client's scopes include Mail.ReadWrite.
+
+        We consult ``self.scopes`` (which reflects the scopes the caller
+        intended to request + any explicit ``upgrade_scopes`` calls) rather
+        than cracking the access token. That keeps the check cheap and
+        avoids pulling a JWT library in just for this.
+
+        Mail.ReadWrite implies Mail.Read and Mail.Send on the Graph
+        permission model, so any of ``Mail.ReadWrite`` or ``Mail.ReadWrite.All``
+        counts as "can write."
+        """
+        write_markers = {"mail.readwrite", "mail.readwrite.all"}
+        normalized = {str(s).lower() for s in (self.scopes or [])}
+        return bool(write_markers & normalized)
+
 
 # =============================================================================
 # OUTLOOK CLIENT
@@ -801,6 +1528,134 @@ class OutlookClient:
 
         # For win32com, we store COM references keyed by email ID for attachment download
         self._win32_msg_cache: Dict[str, Any] = {}
+
+    # -------------------------------------------------------------------------
+    # WRITE VERBS (Bolt 4) — move / delete / mark_read
+    # -------------------------------------------------------------------------
+    #
+    # Thin dispatch methods. Each returns an :class:`OperationResult`. The
+    # backend-specific interpretation of ``message_id`` matters:
+    #
+    # * AppleScript: ``"as_msg_<N>"`` style — the numeric index inside
+    #   ``source_folder`` (or Inbox). Session-scoped — callers that persist
+    #   ids across time must refresh via ``search()``. The optional
+    #   ``source_folder`` / ``folder_name`` kwargs below carry the needed
+    #   folder context.
+    # * COM: the Outlook ``EntryID`` string. Valid across sessions but
+    #   invalidated on move (we rewrite to the moved item's new EntryID in
+    #   the returned OperationResult).
+    # * Graph: the Graph message id. Stable across sessions.
+
+    def move(
+        self,
+        message_id: str,
+        target_folder: str,
+        *,
+        source_folder: Optional[str] = None,
+    ) -> OperationResult:
+        """Move a message to ``target_folder``.
+
+        Args:
+            message_id: Backend-scoped message identifier (see class notes).
+            target_folder: Destination folder name. Will be created if the
+                active backend supports detect-and-create (AppleScript/COM).
+            source_folder: (AppleScript only) Folder the message lives in.
+                Defaults to Inbox. Ignored for COM and Graph where the
+                message_id is self-locating.
+
+        Returns:
+            :class:`OperationResult` with ``verified=True`` only after a
+            round-trip confirms the message landed in ``target_folder``.
+        """
+        if self.backend == "applescript":
+            idx = _parse_as_msg_index(message_id)
+            return self._applescript.move(
+                msg_index=idx,
+                target_folder=target_folder,
+                source_folder=source_folder,
+            )
+        if self.backend == "win32com":
+            return self._move_win32(message_id, target_folder)
+        if self.backend == "graph":
+            return self._move_graph(message_id, target_folder)
+        raise RuntimeError(f"Unknown backend: {self.backend}")
+
+    def delete(
+        self,
+        message_id: str,
+        *,
+        permanent: bool = False,
+        yes_really_permanent: bool = False,
+        folder_name: Optional[str] = None,
+    ) -> OperationResult:
+        """Delete a message — soft-delete (move to Deleted Items) by default.
+
+        Args:
+            message_id: Backend-scoped message identifier.
+            permanent: If True, bypass Deleted Items and hard-delete the
+                message. MUST be paired with ``yes_really_permanent=True`` —
+                otherwise this method raises ``ValueError``. The double-flag
+                is per-call on purpose (panel F6, unanimous): no amount of
+                ``--yes`` global flag survives surviving an operator slip.
+            yes_really_permanent: Explicit acknowledgement that hard-delete
+                is intentional. Only consulted when ``permanent=True``.
+            folder_name: (AppleScript only) Source folder — defaults to Inbox.
+
+        Returns:
+            :class:`OperationResult` with ``after_state["permanent"]``
+            reflecting which path ran.
+        """
+        if permanent and not yes_really_permanent:
+            raise ValueError(
+                "Refusing to hard-delete: permanent=True requires "
+                "yes_really_permanent=True to be set in the same call. "
+                "This double-flag is intentional — soft-delete (default) "
+                "is almost always what you want."
+            )
+        if self.backend == "applescript":
+            idx = _parse_as_msg_index(message_id)
+            return self._applescript.delete_message(
+                msg_index=idx,
+                folder_name=folder_name,
+                permanent=permanent,
+            )
+        if self.backend == "win32com":
+            return self._delete_win32(message_id, permanent=permanent)
+        if self.backend == "graph":
+            return self._delete_graph(message_id, permanent=permanent)
+        raise RuntimeError(f"Unknown backend: {self.backend}")
+
+    def mark_read(
+        self,
+        message_id: str,
+        *,
+        read: bool = True,
+        folder_name: Optional[str] = None,
+    ) -> OperationResult:
+        """Set the read/unread flag on a message.
+
+        Args:
+            message_id: Backend-scoped message identifier.
+            read: True to mark read, False to mark unread.
+            folder_name: (AppleScript only) Folder the message lives in.
+                Defaults to Inbox.
+
+        Returns:
+            :class:`OperationResult` with ``verified=True`` only when a
+            re-fetch confirms ``after_state["is_read"] == read``.
+        """
+        if self.backend == "applescript":
+            idx = _parse_as_msg_index(message_id)
+            return self._applescript.mark_read(
+                msg_index=idx,
+                folder_name=folder_name,
+                read=read,
+            )
+        if self.backend == "win32com":
+            return self._mark_read_win32(message_id, read=read)
+        if self.backend == "graph":
+            return self._mark_read_graph(message_id, read=read)
+        raise RuntimeError(f"Unknown backend: {self.backend}")
 
     # -------------------------------------------------------------------------
     # SEARCH
@@ -1439,6 +2294,233 @@ class OutlookClient:
         return results
 
     # =========================================================================
+    # WIN32COM WRITE OPERATIONS (Bolt 4)
+    # =========================================================================
+    #
+    # CRITICAL: Outlook's MailItem.Move() returns the moved item. After the
+    # call, the ORIGINAL handle (by EntryID in the source store) is invalid
+    # — the message now lives at a different EntryID in the destination
+    # store. We MUST capture the returned item for verify. Never re-query
+    # the old EntryID.
+
+    def _get_win32_message_by_entry_id(self, entry_id: str):
+        """Resolve an Outlook MailItem by EntryID via the MAPI namespace."""
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        return namespace.GetItemFromID(entry_id)
+
+    def _win32_message_snapshot(self, msg) -> Dict[str, Any]:
+        """Return a dict snapshot of the salient fields on a MailItem."""
+        try:
+            parent_name = msg.Parent.Name if msg.Parent is not None else ""
+        except Exception:
+            parent_name = ""
+        return {
+            "folder": parent_name or "Inbox",
+            "is_read": not bool(getattr(msg, "UnRead", False)),
+            "subject": getattr(msg, "Subject", "") or "",
+            "sender_email": getattr(msg, "SenderEmailAddress", "") or "",
+            "entry_id": getattr(msg, "EntryID", "") or "",
+        }
+
+    def _mark_read_win32(
+        self, entry_id: str, read: bool = True,
+    ) -> OperationResult:
+        """Mark a message read/unread via COM and verify."""
+        start_ms = _time_module.perf_counter()
+        operation = "mark_read"
+        try:
+            msg = self._get_win32_message_by_entry_id(entry_id)
+            before = self._win32_message_snapshot(msg)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                error_detail=f"pre-fetch failed: {e}", backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        try:
+            msg.UnRead = not bool(read)
+            msg.Save()
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"COM error during write: {e}",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        # Round-trip verify. EntryID is still valid (mark_read doesn't move).
+        try:
+            msg_refetched = self._get_win32_message_by_entry_id(entry_id)
+            after = self._win32_message_snapshot(msg_refetched)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"post-verify fetch failed: {e}",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        verified = after["is_read"] == bool(read)
+        return OperationResult(
+            status="success" if verified else "failed",
+            operation=operation, message_id=entry_id, verified=verified,
+            before_state=before, after_state=after,
+            error_detail=None if verified else "post-state did not match request",
+            backend="win32com",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _resolve_win32_folder(self, folder_name: str):
+        """Find a target folder by name, creating it if missing on the default store."""
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        # Default folders handled by _get_win32_folder
+        try:
+            return self._get_win32_folder(folder_name)
+        except Exception:
+            pass
+        # Otherwise: ensure a top-level folder on the default store.
+        inbox = namespace.GetDefaultFolder(6)  # olFolderInbox
+        root = inbox.Parent
+        for f in root.Folders:
+            if f.Name.lower() == folder_name.lower():
+                return f
+        # Create it
+        return root.Folders.Add(folder_name)
+
+    def _move_win32(
+        self, entry_id: str, target_folder: str,
+    ) -> OperationResult:
+        """Move a message to ``target_folder`` and verify via the Move() return."""
+        start_ms = _time_module.perf_counter()
+        operation = "move"
+        if not target_folder:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                error_detail="target_folder must be a non-empty folder name",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        try:
+            msg = self._get_win32_message_by_entry_id(entry_id)
+            before = self._win32_message_snapshot(msg)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                error_detail=f"pre-fetch failed: {e}", backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        try:
+            target = self._resolve_win32_folder(target_folder)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"folder resolution failed: {e}",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        # CRITICAL (panel-flagged): capture the returned moved item.
+        try:
+            moved = msg.Move(target)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"COM Move() error: {e}",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        if moved is None:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail="COM Move() returned None (move did not take effect)",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        after = self._win32_message_snapshot(moved)
+        verified = after["folder"].lower() == target_folder.lower() or (
+            # Resolved folder name may be the canonical one (e.g. "Archive" via
+            # a default-folder constant); accept a match on the resolved folder.
+            after["folder"].lower() == getattr(target, "Name", target_folder).lower()
+        )
+        new_entry_id = getattr(moved, "EntryID", None)
+        return OperationResult(
+            status="success" if verified else "failed",
+            operation=operation,
+            # Report the new EntryID — the old one is invalidated.
+            message_id=new_entry_id or entry_id,
+            verified=verified,
+            before_state=before, after_state=after,
+            error_detail=None if verified else (
+                f"post-move verify: moved item's parent={after['folder']!r} "
+                f"not {target_folder!r}"
+            ),
+            backend="win32com",
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _delete_win32(
+        self, entry_id: str, permanent: bool = False,
+    ) -> OperationResult:
+        """Delete a message — soft-delete (Deleted Items) by default."""
+        start_ms = _time_module.perf_counter()
+        operation = "delete"
+        if not permanent:
+            # Soft-delete is a Move to Deleted Items — same verify path.
+            move_res = self._move_win32(entry_id, "Deleted Items")
+            return OperationResult(
+                status=move_res.status, operation=operation,
+                message_id=move_res.message_id, verified=move_res.verified,
+                before_state=move_res.before_state,
+                after_state={**move_res.after_state, "permanent": False},
+                error_detail=move_res.error_detail, backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        # Hard delete.
+        try:
+            msg = self._get_win32_message_by_entry_id(entry_id)
+            before = self._win32_message_snapshot(msg)
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                error_detail=f"pre-fetch failed: {e}", backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        try:
+            msg.Delete()
+        except Exception as e:
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                before_state=before,
+                error_detail=f"COM Delete() error: {e}", backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        # Verify absence — refetch by EntryID should raise.
+        try:
+            self._get_win32_message_by_entry_id(entry_id)
+            # If we got here, the message still exists — silent success.
+            return OperationResult(
+                status="failed", operation=operation, message_id=entry_id,
+                verified=False, before_state=before,
+                after_state={"folder": None, "permanent": True},
+                error_detail="post-delete verify: EntryID still resolves",
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        except Exception:
+            # Can't refetch — that's what we want.
+            return OperationResult(
+                status="success", operation=operation, message_id=entry_id,
+                verified=True, before_state=before,
+                after_state={"folder": None, "permanent": True},
+                backend="win32com",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+
+    # =========================================================================
     # GRAPH API IMPLEMENTATION
     # =========================================================================
 
@@ -1600,6 +2682,168 @@ class OutlookClient:
         self._graph._api_post(url, {"message": message})
         return True
 
+    # =========================================================================
+    # GRAPH WRITE OPERATIONS (Bolt 4) — scope-gated
+    # =========================================================================
+    #
+    # Phase 1 does NOT auto-upgrade to Mail.ReadWrite. If the current token
+    # lacks that scope we return status="unsupported" so callers see the
+    # scope cliff instead of a runtime 403. If the scope IS granted and the
+    # API returns 403, we surface a failed status with the 403 detail —
+    # scope-missing and permission-denied are NEVER conflated (panel F2).
+
+    _UNSUPPORTED_DETAIL = (
+        "OAuth grant lacks Mail.ReadWrite — use COM/AppleScript backend, "
+        "or request a scope upgrade and construct OutlookClient with "
+        "scopes=['Mail.ReadWrite']"
+    )
+
+    def _graph_unsupported(self, operation: str, message_id: Optional[str],
+                           elapsed_ms: int) -> OperationResult:
+        return OperationResult(
+            status="unsupported",
+            operation=operation,
+            message_id=message_id,
+            error_detail=self._UNSUPPORTED_DETAIL,
+            backend="graph",
+            elapsed_ms=elapsed_ms,
+        )
+
+    def _graph_write_request(
+        self, method: str, url: str, operation: str, message_id: str,
+        start_ms: float, json_body: Optional[Dict[str, Any]] = None,
+    ) -> OperationResult:
+        """Issue a write request against Graph and translate the response.
+
+        Returns ``OperationResult`` — caller does not need to try/except. On
+        4xx we distinguish scope-missing (should never happen past the
+        has_write_scope check, but defence in depth) from 403 permission
+        denied.
+        """
+        try:
+            kwargs: Dict[str, Any] = {}
+            if json_body is not None:
+                kwargs["json"] = json_body
+            resp = self._graph._api_request(method, url, **kwargs)
+        except Exception as e:
+            # requests.HTTPError on 4xx; our _api_request calls raise_for_status.
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            body_text = ""
+            try:
+                body_text = e.response.text  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            if status_code == 403:
+                return OperationResult(
+                    status="failed", operation=operation, message_id=message_id,
+                    error_detail=f"HTTP 403 (permission denied): {body_text or e!s}",
+                    backend="graph",
+                    elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                )
+            if status_code == 401:
+                return OperationResult(
+                    status="failed", operation=operation, message_id=message_id,
+                    error_detail=f"HTTP 401 (auth failed): {body_text or e!s}",
+                    backend="graph",
+                    elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+                )
+            return OperationResult(
+                status="failed", operation=operation, message_id=message_id,
+                error_detail=f"Graph request error: {e}",
+                backend="graph",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        return OperationResult(
+            status="success", operation=operation, message_id=message_id,
+            verified=True,  # Graph returns 2xx only when it actually applied
+            backend="graph",
+            after_state={"http_status": resp.status_code},
+            elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+        )
+
+    def _mark_read_graph(
+        self, message_id: str, read: bool = True,
+    ) -> OperationResult:
+        """Mark a Graph message as read/unread.
+
+        Returns status="unsupported" unless the current token has Mail.ReadWrite.
+        """
+        start_ms = _time_module.perf_counter()
+        operation = "mark_read"
+        if not self._graph.has_write_scope():
+            return self._graph_unsupported(
+                operation, message_id,
+                int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        msg_id_quoted = _url_quote(str(message_id), safe="")
+        url = f"{GRAPH_API_BASE}/me/messages/{msg_id_quoted}"
+        return self._graph_write_request(
+            "patch", url, operation, message_id, start_ms,
+            json_body={"isRead": bool(read)},
+        )
+
+    def _move_graph(
+        self, message_id: str, target_folder: str,
+    ) -> OperationResult:
+        """Move a Graph message to ``target_folder`` (well-known name or ID).
+
+        Returns status="unsupported" unless the current token has Mail.ReadWrite.
+        """
+        start_ms = _time_module.perf_counter()
+        operation = "move"
+        if not self._graph.has_write_scope():
+            return self._graph_unsupported(
+                operation, message_id,
+                int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        if not target_folder:
+            return OperationResult(
+                status="failed", operation=operation, message_id=message_id,
+                error_detail="target_folder must be a non-empty folder name",
+                backend="graph",
+                elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        msg_id_quoted = _url_quote(str(message_id), safe="")
+        url = f"{GRAPH_API_BASE}/me/messages/{msg_id_quoted}/move"
+        return self._graph_write_request(
+            "post", url, operation, message_id, start_ms,
+            json_body={"destinationId": target_folder},
+        )
+
+    def _delete_graph(
+        self, message_id: str, permanent: bool = False,
+    ) -> OperationResult:
+        """Delete a Graph message (soft-delete via move to deleteditems by default).
+
+        Returns status="unsupported" unless the current token has Mail.ReadWrite.
+        """
+        start_ms = _time_module.perf_counter()
+        operation = "delete"
+        if not self._graph.has_write_scope():
+            return self._graph_unsupported(
+                operation, message_id,
+                int((_time_module.perf_counter() - start_ms) * 1000),
+            )
+        msg_id_quoted = _url_quote(str(message_id), safe="")
+        if not permanent:
+            # Soft-delete = move to deleteditems well-known folder.
+            url = f"{GRAPH_API_BASE}/me/messages/{msg_id_quoted}/move"
+            result = self._graph_write_request(
+                "post", url, operation, message_id, start_ms,
+                json_body={"destinationId": "deleteditems"},
+            )
+            if result.status == "success":
+                result.after_state = {**result.after_state, "permanent": False}
+            return result
+        # Hard delete.
+        url = f"{GRAPH_API_BASE}/me/messages/{msg_id_quoted}"
+        result = self._graph_write_request(
+            "delete", url, operation, message_id, start_ms,
+        )
+        if result.status == "success":
+            result.after_state = {**result.after_state, "permanent": True, "folder": None}
+        return result
+
     def _get_events_graph(self, date_from, date_to, max_results) -> List[Dict]:
         """Get calendar events via Microsoft Graph API."""
         start_str = date_from.strftime("%Y-%m-%dT00:00:00Z")
@@ -1746,3 +2990,21 @@ def _extract_domain(email_addr: str) -> str:
     if "@" in email_addr:
         return email_addr.split("@")[-1].lower()
     return ""
+
+
+def _parse_as_msg_index(message_id: str) -> int:
+    """Parse the ``as_msg_<N>`` form used by the AppleScript backend.
+
+    Accepts both ``"as_msg_42"`` (as returned by ``search()``) and a bare
+    numeric string ``"42"``. Raises ``ValueError`` on anything else.
+    """
+    s = str(message_id).strip()
+    if s.startswith("as_msg_"):
+        s = s[len("as_msg_"):]
+    try:
+        return int(s)
+    except ValueError:
+        raise ValueError(
+            f"AppleScript message_id must be of the form 'as_msg_<N>' or a "
+            f"numeric string; got {message_id!r}"
+        )

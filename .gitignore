@@ -23,3 +23,9 @@ Thumbs.db
 
 # Private email summaries
 docs/email-summaries/
+
+# Tooling artifacts
+.audit.db
+
+# Triage reports (generated locally; never committed)
+output/
