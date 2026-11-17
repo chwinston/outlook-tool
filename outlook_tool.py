@@ -209,9 +209,33 @@ class _AppleScriptBackend:
 
     Requires macOS with Microsoft Outlook running in Legacy/Classic mode.
     No API keys or Azure registration needed — talks directly to the local app.
+
+    Bolt 5 — verify hardening
+    -------------------------
+    The AppleScript ``move`` command returns before the Exchange→client sync
+    settles, so a verify scan that fires immediately sees the pre-move cached
+    state and reports "still in source" for a message that actually did move.
+    See ``docs/pm/plans/20261117-0740-bolt5-batching-plan.md`` for the pick-off
+    experiment that confirmed this.
+
+    Two mitigations, both configurable via constructor args (both honour env
+    overrides so the apply-triage CLI can tune without API change):
+
+    * ``verify_delay_ms`` (``OUTLOOK_TOOL_VERIFY_DELAY_MS``, default 1500ms) —
+      sleep between the AppleScript write and the fingerprint verify scan.
+    * ``verify_use_count_check`` (``OUTLOOK_TOOL_VERIFY_USE_COUNT``, default
+      True) — gate verify on a source-folder count delta. If the source count
+      dropped by one, that is strong evidence of success even when the
+      fingerprint scan can't find the row (large Deleted Items / Archive).
     """
 
-    def __init__(self):
+    _DEFAULT_VERIFY_DELAY_MS = 1500
+
+    def __init__(
+        self,
+        verify_delay_ms: Optional[int] = None,
+        verify_use_count_check: Optional[bool] = None,
+    ):
         if sys.platform != "darwin":
             raise RuntimeError("AppleScript backend only works on macOS")
 
@@ -225,6 +249,27 @@ class _AppleScriptBackend:
                 f"Cannot connect to Outlook for Mac. "
                 f"Make sure Outlook is running in Legacy/Classic mode.\n{e}"
             )
+
+        if verify_delay_ms is None:
+            env = os.environ.get("OUTLOOK_TOOL_VERIFY_DELAY_MS")
+            if env is not None:
+                try:
+                    verify_delay_ms = max(0, int(env))
+                except ValueError:
+                    verify_delay_ms = self._DEFAULT_VERIFY_DELAY_MS
+            else:
+                verify_delay_ms = self._DEFAULT_VERIFY_DELAY_MS
+        self.verify_delay_ms = max(0, int(verify_delay_ms))
+
+        if verify_use_count_check is None:
+            env = os.environ.get("OUTLOOK_TOOL_VERIFY_USE_COUNT")
+            if env is not None:
+                verify_use_count_check = env.strip().lower() not in {
+                    "0", "false", "no", "off",
+                }
+            else:
+                verify_use_count_check = True
+        self.verify_use_count_check = bool(verify_use_count_check)
 
     def scan_emails(
         self,
@@ -802,6 +847,10 @@ end tell
                 elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
             )
 
+        # Bolt 5 (B5.3) — settle delay before verify so Exchange→client
+        # sync has caught up before we re-read the message state.
+        self._sleep_verify_delay()
+
         # Round-trip verify.
         try:
             after = self._fetch_message_state(msg_index, folder_name)
@@ -936,6 +985,14 @@ end tell
                 elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
             )
 
+        # Bolt 5 (B5.3) — capture source folder count BEFORE the move so we can
+        # use count-delta as a verify signal (robust against sync-lag).
+        pre_count = (
+            self._folder_message_count(source_folder)
+            if self.verify_use_count_check
+            else -1
+        )
+
         safe_target = _escape_applescript(target_folder)
         script = f'''
 tell application "Microsoft Outlook"
@@ -956,14 +1013,26 @@ end tell
                 elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
             )
 
-        # Round-trip verify (Tim F1) uses TWO signals:
-        # (1) source-absence: is the message still in the source folder? If
-        #     no, the move clearly succeeded (this is the strong signal on
-        #     large mailboxes where target-folder scans can't cover all rows).
-        # (2) target-presence by fingerprint, scan_limit=500 to tolerate large
-        #     Deleted Items / Archive folders.
+        # Bolt 5 (B5.3) — settle delay before verify. The move returns before
+        # Exchange→client sync has caught up; without this delay the verify
+        # scan sees cached state and reports false-failure in 29%+ of ops.
+        self._sleep_verify_delay()
+
+        # Round-trip verify (Tim F1) uses THREE signals now (Bolt 5):
+        # (1) count-delta on source: fast + robust against fingerprint miss
+        # (2) source-absence via fingerprint scan (legacy signal)
+        # (3) target-presence via fingerprint scan (weakest — target may be
+        #     huge and the match can fall off the scan limit)
         target_subject = before.get("subject", "")
         target_sender = before.get("sender_email", "")
+
+        post_count = (
+            self._folder_message_count(source_folder)
+            if self.verify_use_count_check
+            else -1
+        )
+        count_check_available = pre_count >= 0 and post_count >= 0
+        count_dropped = count_check_available and (pre_count - post_count) >= 1
 
         still_in_source = self._verify_present_in_folder(
             folder_name=source_folder,
@@ -978,10 +1047,11 @@ end tell
             scan_limit=500,
         )
 
-        # The move succeeded if the message is GONE from source. Target-side
-        # presence is secondary — large Deleted Items can hide the row past
-        # the scan limit.
-        move_succeeded = not still_in_source
+        # The move succeeded if EITHER the count dropped OR the fingerprint
+        # scan says the message is gone from source. Count-delta is the new
+        # primary signal under Bolt 5 — it addresses the sync-lag false-failure
+        # mode directly. Target-side presence is confirmation icing.
+        move_succeeded = count_dropped or (not still_in_source)
         verified = move_succeeded and present_in_target
 
         after: Dict[str, Any] = {
@@ -1024,6 +1094,62 @@ end tell
             backend="applescript",
             elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
         )
+
+    def _sleep_verify_delay(self) -> None:
+        """Sleep for ``verify_delay_ms`` to let Exchange→client sync settle.
+
+        Called between an AppleScript write and the verify scan that follows.
+        Diagnoses in ``docs/pm/plans/20261117-0740-bolt5-batching-plan.md``
+        pin false-failure reports on this sync lag.
+        """
+        if self.verify_delay_ms <= 0:
+            return
+        _time_module.sleep(self.verify_delay_ms / 1000.0)
+
+    def _folder_message_count(self, folder_name: Optional[str]) -> int:
+        """Return ``messages.length`` for ``folder_name`` on the primary account.
+
+        Used as a count-delta verify signal — if the source folder dropped by
+        the expected number of messages after a (bulk) move, treat it as
+        strong evidence of success even when the fingerprint scan misses.
+
+        Returns ``-1`` if the folder cannot be resolved; callers treat that
+        as "count-check unavailable" (fall back to fingerprint only).
+        """
+        safe_folder = json.dumps(folder_name or "Inbox")
+        script = f"""
+        (function() {{
+            var outlook = Application("Microsoft Outlook");
+            var folderName = {safe_folder};
+            var folder;
+            if (!folderName || folderName.toLowerCase() === "inbox") {{
+                folder = outlook.inbox;
+            }} else {{
+                var accts = outlook.exchangeAccounts();
+                if (accts.length === 0) return "-1";
+                var allFolders = accts[0].mailFolders();
+                for (var fi = 0; fi < allFolders.length; fi++) {{
+                    try {{
+                        if (allFolders[fi].name() === folderName) {{
+                            folder = allFolders[fi];
+                            break;
+                        }}
+                    }} catch(e) {{}}
+                }}
+                if (!folder) return "-1";
+            }}
+            try {{
+                return String(folder.messages.length);
+            }} catch(e) {{
+                return "-1";
+            }}
+        }})();
+        """
+        try:
+            raw = _run_jxa(script, timeout=30)
+            return int(raw.strip() or "-1")
+        except Exception:
+            return -1
 
     def _verify_present_in_folder(
         self,
@@ -1157,6 +1283,13 @@ end tell
                 elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
             )
 
+        # Bolt 5 — capture pre-count for count-delta verify (B5.3).
+        pre_count = (
+            self._folder_message_count(source_folder)
+            if self.verify_use_count_check
+            else -1
+        )
+
         script = f'''
 tell application "Microsoft Outlook"
     set m to message {msg_index} of {src_ref}
@@ -1176,14 +1309,24 @@ end tell
                 elapsed_ms=int((_time_module.perf_counter() - start_ms) * 1000),
             )
 
-        # Verify: message should NOT be present in source folder by fingerprint.
+        # Bolt 5 (B5.3) — settle delay before verify, then count-check + fingerprint.
+        self._sleep_verify_delay()
+
+        post_count = (
+            self._folder_message_count(source_folder)
+            if self.verify_use_count_check
+            else -1
+        )
+        count_check_available = pre_count >= 0 and post_count >= 0
+        count_dropped = count_check_available and (pre_count - post_count) >= 1
+
         still_there = self._verify_present_in_folder(
             folder_name=source_folder,
             subject=before.get("subject", ""),
             sender_email=before.get("sender_email", ""),
             scan_limit=500,
         )
-        verified = not still_there
+        verified = count_dropped or (not still_there)
         return OperationResult(
             status="success" if verified else "failed",
             operation=operation,
