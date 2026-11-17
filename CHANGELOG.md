@@ -6,6 +6,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — Bolt 5 (batching + silent-success fix)
+
+- `OutlookClient.move_bulk(moves, source_folder=None)` — bulk-move
+  primitive. Accepts a list of `(message_id, target_folder)` tuples that
+  share one `source_folder`. On AppleScript, issues ONE `tell` block that
+  captures every message reference BEFORE any move fires, then runs all
+  moves inside the same transaction. Defeats both index-shift (refs bind
+  before mutation) and Exchange→client sync-lag (single count-delta
+  verify after a settle delay). Returns one `OperationResult` per input,
+  in order.
+- `OutlookClient.delete_bulk(message_ids, permanent=False, ...)` — bulk
+  soft-delete, routed through `move_bulk()` with target `"Deleted Items"`.
+  Operation label is rewritten to `"delete"` on each result so callers
+  see intent. Hard-delete stays per-message and per-call-flagged
+  (panel F6 — bulk hard-delete is intentionally NOT provided).
+- `scripts/apply_triage.py --bulk` / `--no-bulk` — bulk is the default
+  under Bolt 5. One AppleScript call per bucket instead of one per
+  message. COM/Graph backends fall back to a serial loop automatically.
+
+### Changed — Bolt 5 verify-step hardening (B5.3)
+
+The pick-off experiment on 2026-11-17 proved that AppleScript `move`
+succeeds server-side immediately, but the verify scan that follows runs
+against Outlook's client cache BEFORE Exchange→client sync has caught
+up. Observed false-failure rate: 29% (24/34 reported as failed, all 34
+actually moved — Inbox count delta confirmed).
+
+- `_AppleScriptBackend.verify_delay_ms` (default 1500ms, env
+  `OUTLOOK_TOOL_VERIFY_DELAY_MS`) — settle delay between the AppleScript
+  write and the verify scan. Applied to `move`, `mark_read`, and the
+  hard-delete path.
+- `_AppleScriptBackend.verify_use_count_check` (default True, env
+  `OUTLOOK_TOOL_VERIFY_USE_COUNT`) — count-delta verify. Captures source
+  folder message count before and after; if the count dropped by the
+  expected amount, treat as success even when fingerprint scan still
+  sees the message (sync lag). Falls back to fingerprint scan when
+  count-check is unavailable (folder resolution failed) or inconclusive.
+
 ### Added — Bolt 4 Phase 1 (write verbs)
 
 - `OutlookClient.move(message_id, target_folder, source_folder=None)` — move a

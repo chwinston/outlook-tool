@@ -173,11 +173,21 @@ def seeded_test_message(bolt4_test_folder):
 from unittest.mock import patch  # noqa: E402
 
 
-def _make_applescript_backend():
-    """Build an ``_AppleScriptBackend`` without invoking Outlook."""
+def _make_applescript_backend(
+    verify_delay_ms: int = 0,
+    verify_use_count_check: bool = False,
+):
+    """Build an ``_AppleScriptBackend`` without invoking Outlook.
+
+    Default ``verify_delay_ms=0`` and ``verify_use_count_check=False`` keep
+    unit tests fast and independent of Bolt 5 count-check code paths unless
+    the test explicitly opts in.
+    """
     from outlook_tool import _AppleScriptBackend
     backend = _AppleScriptBackend.__new__(_AppleScriptBackend)
     backend._version = "16.0"
+    backend.verify_delay_ms = verify_delay_ms
+    backend.verify_use_count_check = verify_use_count_check
     return backend
 
 
@@ -358,6 +368,387 @@ class TestAppleScriptDelete:
         assert r.status == "failed"
         assert r.verified is False
         assert "still present" in (r.error_detail or "")
+
+
+# =============================================================================
+# Bolt 5 (B5.3) — verify-step hardening
+# =============================================================================
+
+
+class TestVerifyHardening:
+    """B5.3 — settle delay + count-delta verify defeat Exchange sync-lag false-failures."""
+
+    def test_settle_delay_is_called_before_verify_on_move(self):
+        """_sleep_verify_delay must fire between AppleScript write and verify."""
+        backend = _make_applescript_backend(verify_delay_ms=25)
+        before = {"folder": "Inbox", "is_read": False, "subject": "S", "sender_email": "a@b.com"}
+        with patch.object(backend, "_fetch_message_state", return_value=before), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_verify_present_in_folder", return_value=False), \
+             patch.object(backend, "_sleep_verify_delay") as sleep_mock, \
+             patch("outlook_tool._run_applescript", return_value=""):
+            backend.move(msg_index=1, target_folder="Archive", source_folder="Inbox")
+        sleep_mock.assert_called_once()
+
+    def test_settle_delay_is_called_on_hard_delete(self):
+        backend = _make_applescript_backend(verify_delay_ms=25)
+        before = {"folder": "Inbox", "is_read": False, "subject": "S", "sender_email": "a@b.com"}
+        with patch.object(backend, "_fetch_message_state", return_value=before), \
+             patch.object(backend, "_verify_present_in_folder", return_value=False), \
+             patch.object(backend, "_sleep_verify_delay") as sleep_mock, \
+             patch("outlook_tool._run_applescript", return_value=""):
+            backend.delete_message(msg_index=4, folder_name="Inbox", permanent=True)
+        sleep_mock.assert_called_once()
+
+    def test_settle_delay_is_called_on_mark_read(self):
+        backend = _make_applescript_backend(verify_delay_ms=25)
+        before = {"folder": "Inbox", "is_read": False, "subject": "S", "sender_email": "a@b.com"}
+        after = {"folder": "Inbox", "is_read": True, "subject": "S", "sender_email": "a@b.com"}
+        with patch.object(backend, "_fetch_message_state", side_effect=[before, after]), \
+             patch.object(backend, "_sleep_verify_delay") as sleep_mock, \
+             patch("outlook_tool._run_applescript", return_value=""):
+            backend.mark_read(msg_index=1, folder_name="Inbox", read=True)
+        sleep_mock.assert_called_once()
+
+    def test_count_drop_overrides_fingerprint_false_failure(self):
+        """Hypothesis 2 fix: if source count dropped, treat as success even
+        when the fingerprint scan still sees the message (cache lag)."""
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        before = {"folder": "Inbox", "is_read": False, "subject": "S", "sender_email": "a@b.com"}
+        # Count went 100 → 99 (the move actually dropped the source), but
+        # the fingerprint scan still sees the message (sync lag).
+        with patch.object(backend, "_fetch_message_state", return_value=before), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count", side_effect=[100, 99]), \
+             patch.object(backend, "_verify_present_in_folder", return_value=True), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            r = backend.move(msg_index=1, target_folder="Archive", source_folder="Inbox")
+        assert r.status == "success", r.error_detail
+        # No present_in_target confirmation + count-drop only → unverified-success.
+        # (we assert move_succeeded, the verified bit depends on target presence)
+        assert "unconfirmed" in (r.error_detail or "").lower() or r.verified
+
+    def test_count_stable_with_fingerprint_present_still_fails(self):
+        """If the count didn't drop AND the fingerprint still sees the
+        message, the move really didn't take effect."""
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        before = {"folder": "Inbox", "is_read": False, "subject": "S", "sender_email": "a@b.com"}
+        with patch.object(backend, "_fetch_message_state", return_value=before), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count", side_effect=[100, 100]), \
+             patch.object(backend, "_verify_present_in_folder", return_value=True), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            r = backend.move(msg_index=1, target_folder="Archive", source_folder="Inbox")
+        assert r.status == "failed"
+        assert r.verified is False
+        assert "silent-success" in (r.error_detail or "")
+
+    def test_count_check_disabled_falls_back_to_fingerprint(self):
+        """With count-check off, verify behaves like Bolt 4 — fingerprint only."""
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=False,
+        )
+        before = {"folder": "Inbox", "is_read": False, "subject": "S", "sender_email": "a@b.com"}
+
+        def verify_side_effect(folder_name, subject, sender_email, scan_limit):
+            if folder_name == "Inbox":
+                return False  # not in source → move succeeded
+            return True
+
+        with patch.object(backend, "_fetch_message_state", return_value=before), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count") as count_mock, \
+             patch.object(backend, "_verify_present_in_folder", side_effect=verify_side_effect), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            r = backend.move(msg_index=1, target_folder="Archive", source_folder="Inbox")
+        # Never call count when check is disabled.
+        count_mock.assert_not_called()
+        assert r.status == "success"
+        assert r.verified is True
+
+    def test_count_check_unavailable_falls_through_to_fingerprint(self):
+        """If _folder_message_count returns -1 (resolve failed), fall back."""
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        before = {"folder": "Inbox", "is_read": False, "subject": "S", "sender_email": "a@b.com"}
+
+        def verify_side_effect(folder_name, subject, sender_email, scan_limit):
+            if folder_name == "Inbox":
+                return False  # fingerprint says: not in source → move succeeded
+            return True  # confirmed in target
+
+        with patch.object(backend, "_fetch_message_state", return_value=before), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count", return_value=-1), \
+             patch.object(backend, "_verify_present_in_folder", side_effect=verify_side_effect), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            r = backend.move(msg_index=1, target_folder="Archive", source_folder="Inbox")
+        assert r.status == "success"
+        assert r.verified is True
+
+
+# =============================================================================
+# Bolt 5 (B5.2) — AppleScript bulk-move primitive (Shape A)
+# =============================================================================
+
+
+class TestAppleScriptMoveBulk:
+    """move_bulk — Shape A: single tell block, refs-before-moves, count-delta verify."""
+
+    def test_empty_moves_returns_empty(self):
+        backend = _make_applescript_backend()
+        assert backend.move_bulk([], source_folder="Inbox") == []
+
+    def test_happy_path_count_drop_equals_batch_size(self):
+        """Count dropped by N for N moves → every row success (unverified-success tier)."""
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        pre = {"folder": "Inbox", "is_read": False, "subject": "s", "sender_email": "a@b.com"}
+        with patch.object(backend, "_fetch_message_state", return_value=pre), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count", side_effect=[100, 97]), \
+             patch("outlook_tool._run_applescript", return_value="") as run_mock:
+            results = backend.move_bulk(
+                [(5, "Archive"), (7, "Archive"), (9, "Deleted Items")],
+                source_folder="Inbox",
+            )
+        assert len(results) == 3
+        for r in results:
+            assert r.status == "success", r.error_detail
+            assert r.operation == "move"
+            assert r.backend == "applescript"
+        # One AppleScript call for the whole batch — Shape A promise.
+        assert run_mock.call_count == 1
+
+    def test_tell_block_captures_refs_before_moving(self):
+        """The generated script must bind every m1..mN BEFORE issuing any move."""
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        pre = {"folder": "Inbox", "is_read": False, "subject": "s", "sender_email": "a@b.com"}
+        captured = {}
+
+        def capture(script, timeout=60):
+            captured["script"] = script
+            return ""
+
+        with patch.object(backend, "_fetch_message_state", return_value=pre), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count", side_effect=[100, 98]), \
+             patch("outlook_tool._run_applescript", side_effect=capture):
+            backend.move_bulk(
+                [(5, "Archive"), (7, "Archive")],
+                source_folder="Inbox",
+            )
+
+        script = captured["script"]
+        # The three `set m<i>` lines must come before any `move m<i>` line.
+        set_positions = [script.index(f"set m{i}") for i in (1, 2)]
+        move_positions = [script.index(f"move m{i}") for i in (1, 2)]
+        assert max(set_positions) < min(move_positions), \
+            "Shape A violated — refs must bind BEFORE any move fires"
+
+    def test_partial_drop_falls_back_to_per_message_verify(self):
+        """If count dropped by k < N, resolve via fingerprint verify per row."""
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        states = [
+            {"folder": "Inbox", "subject": "A", "sender_email": "a@x.com", "is_read": False},
+            {"folder": "Inbox", "subject": "B", "sender_email": "b@x.com", "is_read": False},
+            {"folder": "Inbox", "subject": "C", "sender_email": "c@x.com", "is_read": False},
+        ]
+
+        def verify_side_effect(folder_name, subject, sender_email, scan_limit):
+            # A and B moved; C still in Inbox.
+            if folder_name == "Inbox":
+                return subject == "C"  # only C still there
+            return subject in {"A", "B"}  # A, B landed in target
+
+        with patch.object(backend, "_fetch_message_state", side_effect=states), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count", side_effect=[100, 98]), \
+             patch.object(backend, "_verify_present_in_folder", side_effect=verify_side_effect), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            results = backend.move_bulk(
+                [(5, "Archive"), (7, "Archive"), (9, "Archive")],
+                source_folder="Inbox",
+            )
+        # Expected drop was 3, got 2 → per-message fallback.
+        assert results[0].status == "success"  # A
+        assert results[0].verified is True
+        assert results[1].status == "success"  # B
+        assert results[1].verified is True
+        assert results[2].status == "failed"    # C still in Inbox
+        assert "bulk partial" in (results[2].error_detail or "")
+
+    def test_script_error_marks_whole_batch_failed(self):
+        """A tell-block exception is the one case we don't trust partial results."""
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        pre = {"folder": "Inbox", "subject": "s", "sender_email": "a@b.com", "is_read": False}
+        with patch.object(backend, "_fetch_message_state", return_value=pre), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count", side_effect=[100, 100]), \
+             patch("outlook_tool._run_applescript", side_effect=RuntimeError("boom")):
+            results = backend.move_bulk(
+                [(5, "Archive"), (7, "Archive")],
+                source_folder="Inbox",
+            )
+        assert all(r.status == "failed" for r in results)
+        assert all("applescript bulk move error" in (r.error_detail or "")
+                   for r in results)
+
+    def test_ensure_folder_failure_on_one_target_isolates_bad_rows(self):
+        """Rows whose target folder can't be ensured are failed; others proceed."""
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        pre = {"folder": "Inbox", "subject": "s", "sender_email": "a@b.com", "is_read": False}
+
+        def ensure_side_effect(name):
+            if name == "Bad Folder":
+                raise RuntimeError("ACL denied")
+
+        with patch.object(backend, "_fetch_message_state", return_value=pre), \
+             patch.object(backend, "ensure_folder", side_effect=ensure_side_effect), \
+             patch.object(backend, "_folder_message_count", side_effect=[100, 99]), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            results = backend.move_bulk(
+                [(5, "Archive"), (7, "Bad Folder"), (9, "Archive")],
+                source_folder="Inbox",
+            )
+        assert results[0].status == "success"
+        assert results[1].status == "failed"
+        assert "ACL denied" in (results[1].error_detail or "")
+        assert results[2].status == "success"
+
+    def test_pre_fetch_failure_on_one_row_isolates_it(self):
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        pre_ok = {"folder": "Inbox", "subject": "s", "sender_email": "a@b.com", "is_read": False}
+
+        def fetch_side(idx, folder):
+            if idx == 7:
+                raise RuntimeError("message_not_found")
+            return pre_ok
+
+        with patch.object(backend, "_fetch_message_state", side_effect=fetch_side), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count", side_effect=[100, 98]), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            results = backend.move_bulk(
+                [(5, "Archive"), (7, "Archive"), (9, "Archive")],
+                source_folder="Inbox",
+            )
+        assert results[0].status == "success"
+        assert results[1].status == "failed"
+        assert "pre-fetch failed" in (results[1].error_detail or "")
+        assert results[2].status == "success"
+
+    def test_count_check_disabled_uses_per_message_verify(self):
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=False,
+        )
+        pre = {"folder": "Inbox", "subject": "s", "sender_email": "a@b.com", "is_read": False}
+
+        def verify_side_effect(folder_name, subject, sender_email, scan_limit):
+            if folder_name == "Inbox":
+                return False  # gone from source
+            return True  # landed in target
+
+        with patch.object(backend, "_fetch_message_state", return_value=pre), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count") as count_mock, \
+             patch.object(backend, "_verify_present_in_folder", side_effect=verify_side_effect), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            results = backend.move_bulk(
+                [(5, "Archive"), (7, "Archive")],
+                source_folder="Inbox",
+            )
+        # Count never queried when disabled.
+        count_mock.assert_not_called()
+        for r in results:
+            assert r.status == "success"
+            assert r.verified is True
+
+    def test_empty_target_folder_rejected_per_row(self):
+        backend = _make_applescript_backend(
+            verify_delay_ms=0, verify_use_count_check=True,
+        )
+        pre = {"folder": "Inbox", "subject": "s", "sender_email": "a@b.com", "is_read": False}
+        with patch.object(backend, "_fetch_message_state", return_value=pre), \
+             patch.object(backend, "ensure_folder"), \
+             patch.object(backend, "_folder_message_count", side_effect=[100, 99]), \
+             patch("outlook_tool._run_applescript", return_value=""):
+            results = backend.move_bulk(
+                [(5, "Archive"), (7, "")],
+                source_folder="Inbox",
+            )
+        assert results[0].status == "success"
+        assert results[1].status == "failed"
+        assert "non-empty" in (results[1].error_detail or "")
+
+
+class TestOutlookClientBulkDispatch:
+    """OutlookClient.move_bulk + delete_bulk — dispatch and double-flag."""
+
+    @patch("outlook_tool.HAS_APPLESCRIPT", True)
+    @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool._AppleScriptBackend.__init__", return_value=None)
+    def test_move_bulk_routes_to_applescript_backend(self, _init):
+        client = OutlookClient()
+        client._applescript = MagicMock()
+        client._applescript.move_bulk.return_value = [
+            OperationResult(status="success", operation="move", message_id="as_msg_5",
+                            backend="applescript"),
+        ]
+        results = client.move_bulk(
+            [("as_msg_5", "Archive")],
+            source_folder="Inbox",
+        )
+        client._applescript.move_bulk.assert_called_once()
+        args, kwargs = client._applescript.move_bulk.call_args
+        # First positional arg is the parsed-index list of tuples.
+        assert args[0] == [(5, "Archive")]
+        assert kwargs["source_folder"] == "Inbox"
+        assert len(results) == 1
+
+    @patch("outlook_tool.HAS_APPLESCRIPT", True)
+    @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool._AppleScriptBackend.__init__", return_value=None)
+    def test_delete_bulk_default_is_soft_delete(self, _init):
+        client = OutlookClient()
+        client._applescript = MagicMock()
+        client._applescript.move_bulk.return_value = [
+            OperationResult(status="success", operation="move", message_id="as_msg_5",
+                            verified=True, backend="applescript",
+                            after_state={"folder": "Deleted Items"}),
+        ]
+        results = client.delete_bulk(["as_msg_5"], folder_name="Inbox")
+        # Routed through move_bulk with target "Deleted Items".
+        args, _kwargs = client._applescript.move_bulk.call_args
+        assert args[0] == [(5, "Deleted Items")]
+        # Operation label is "delete" on the returned result.
+        assert results[0].operation == "delete"
+        assert results[0].after_state.get("permanent") is False
+
+    @patch("outlook_tool.HAS_APPLESCRIPT", True)
+    @patch("outlook_tool.HAS_WIN32", False)
+    @patch("outlook_tool._AppleScriptBackend.__init__", return_value=None)
+    def test_delete_bulk_permanent_requires_double_flag(self, _init):
+        client = OutlookClient()
+        client._applescript = MagicMock()
+        with pytest.raises(ValueError, match="yes_really_permanent"):
+            client.delete_bulk(["as_msg_5"], permanent=True)
 
 
 # =============================================================================

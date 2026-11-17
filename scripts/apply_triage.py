@@ -334,6 +334,64 @@ def _apply_one(
         return None, f"exception on fingerprint retry: {e}"
 
 
+def _apply_bulk(
+    client: OutlookClient,
+    messages: List[Dict[str, Any]],
+    *,
+    action: str,
+    source_folder: str,
+    outcome: ApplyOutcome,
+    progress: bool,
+) -> None:
+    """Fire one bulk-move/delete call for all ``messages`` and tally.
+
+    Bolt 5 (B5.2) bulk path. All messages share ``(source_folder, action)``.
+    AppleScript ids go stale within a single session only when another
+    process mutates the Inbox underneath us; the bulk primitive captures
+    all refs before any move fires inside the same tell block, so the
+    stale-id fingerprint fallback is NOT needed here. If a row fails for
+    any reason, the caller can retry it through the per-message path.
+    """
+    if progress:
+        tgt_label = "Deleted Items" if action == "soft-delete" else action
+        print(
+            f"  Bulk {action} — {len(messages)} message(s) → {tgt_label}",
+            file=sys.stderr,
+        )
+
+    message_ids = [m.get("message_id") or "" for m in messages]
+    try:
+        if action == "soft-delete":
+            results = client.delete_bulk(
+                message_ids,
+                permanent=False,
+                folder_name=source_folder,
+            )
+        else:
+            moves = [(mid, action) for mid in message_ids]
+            results = client.move_bulk(moves, source_folder=source_folder)
+    except Exception as e:
+        # Backend blew up — mark every row as skipped-ambiguous with the
+        # exception message so the operator can investigate.
+        note = f"bulk {action} raised: {e!r}"
+        for m in messages:
+            outcome.tally(m, None, note=note)
+        return
+
+    # Zip results back to the messages. Lengths should match (the primitive
+    # contracts this), but guard anyway so a bug on either side doesn't
+    # scramble the audit log.
+    if len(results) != len(messages):
+        note = (
+            f"bulk {action} returned {len(results)} results for "
+            f"{len(messages)} messages — tallying by position"
+        )
+        print(f"WARNING: {note}", file=sys.stderr)
+
+    for m, r in zip(messages, results):
+        outcome.tally(m, r, note="")
+
+
 def apply_bucket(
     client: OutlookClient,
     report: Dict[str, Any],
@@ -342,6 +400,7 @@ def apply_bucket(
     source_folder: str = "Inbox",
     progress: bool = True,
     exclude_ids: Optional[set] = None,
+    bulk: bool = True,
 ) -> ApplyOutcome:
     """Run the appropriate action on every message in ``bucket``.
 
@@ -352,6 +411,10 @@ def apply_bucket(
     ``exclude_ids`` — optional set of ``message_id`` values to skip. Used by
     the human-reviewed walk-through to preserve rows flagged for keep even
     though the classifier bucketed them.
+
+    ``bulk`` — when True (default under Bolt 5), uses the single-tell-block
+    bulk primitive. When False, falls back to the Bolt 4 per-message loop
+    with fingerprint-fallback recovery.
     """
     action = BUCKET_ACTIONS.get(bucket)
     outcome = ApplyOutcome()
@@ -375,6 +438,16 @@ def apply_bucket(
             f"Excluding {len(exclude)} message id(s) per --exclude-ids.",
             file=sys.stderr,
         )
+
+    if bulk and client.backend == "applescript":
+        _apply_bulk(
+            client, messages,
+            action=action,
+            source_folder=source_folder,
+            outcome=outcome,
+            progress=progress,
+        )
+        return outcome
 
     for i, m in enumerate(messages, 1):
         if progress:
@@ -489,6 +562,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--bulk", dest="bulk", action="store_true",
+        default=True,
+        help=(
+            "Use the Bolt 5 bulk-move primitive (default). Issues ONE "
+            "AppleScript tell block for the entire bucket — much faster "
+            "and avoids the sync-lag false-failure mode that the "
+            "one-at-a-time path hits."
+        ),
+    )
+    parser.add_argument(
+        "--no-bulk", dest="bulk", action="store_false",
+        help=(
+            "Opt out of the bulk primitive and fall back to the Bolt 4 "
+            "per-message loop with fingerprint-fallback recovery."
+        ),
+    )
+    parser.add_argument(
         "--yes-really-permanent", action="store_true",
         help=argparse.SUPPRESS,  # Documented NO. Catch & refuse.
     )
@@ -560,14 +650,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     client = OutlookClient()
-    print(f"\nApplying {args.bucket} → {action} via {client.backend} backend…",
-          file=sys.stderr)
+    bulk_label = (
+        "bulk (Bolt 5)" if args.bulk and client.backend == "applescript"
+        else "per-message (Bolt 4)"
+    )
+    print(
+        f"\nApplying {args.bucket} → {action} via {client.backend} "
+        f"backend — {bulk_label}…",
+        file=sys.stderr,
+    )
 
     outcome = apply_bucket(
         client, report,
         bucket=args.bucket,
         source_folder=args.source_folder,
         exclude_ids=exclude_ids,
+        bulk=args.bulk,
     )
     summary = render_apply_summary(outcome, bucket=args.bucket, action=action)
     print(summary)

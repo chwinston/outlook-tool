@@ -1,5 +1,20 @@
 # Current Sprint
 
+## Bolt 5 — Silent-Success Fix + Batching (OPEN 2026-11-17)
+
+**Status:** OPEN — not yet kicked off
+**Trigger:** B4.3.* graduated early. Observed 44% silent-success rate on 43-msg apply run — reliability pain the deferred trigger was a proxy for.
+**Goal:** Root-cause AppleScript silent-success, implement bulk-move primitive, harden verify step to eliminate phantom UNVERIFIED-success reports.
+**Spec:** [`docs/pm/plans/20261117-0740-bolt5-batching-plan.md`](plans/20261117-0740-bolt5-batching-plan.md)
+**Backlog:** `BACKLOG.md` § Bolt 5
+**Rough sizing:** ~7-9 hours
+
+### Entry point
+
+**B5.1** (root-cause) is blocking B5.2 (bulk-move). Three hypotheses to test against disposable folder with instrumentation. The pick-off experiment 2026-11-17 (one-at-a-time with 2s sleep in descending-index order) is partial evidence toward hypothesis 1 (index-shift race).
+
+---
+
 ## Bolt 4 — Inbox Triage + Write Verbs (SHIPPED 2026-11-16)
 
 **Status:** ✅ COMPLETE — Phase 1 + Phase 2 shipped same-day via autonomous execution
