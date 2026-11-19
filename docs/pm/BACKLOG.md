@@ -1,6 +1,6 @@
 # Backlog
 
-**Last groomed:** 2026-11-19 (Bolt 6 Advanced Triage SHIPPED. 5 behavioral rules + List-Unsubscribe rule + LLM classifier + marketplace scan. Live-run: 141/141 verified-success, Inbox 1,425 → 1,313. Dangerous ignored-sender-cold bug found + fixed mid-run — empty sent-scan now treated as broken scan not "never replied". Captain's log: `docs/captains_log/20261119-0620-bolt6-advanced-triage-shipped.md`.) Prior: 2026-11-17 (Opened Bolt 5 — Phase 3 batching trigger met early. Observed 44% silent-success failure rate on 43-msg apply run, far exceeding acceptable reliability. B4.3.* graduating to B5.*. Spec: `docs/pm/plans/20261117-0740-bolt5-batching-plan.md`.) Prior: 2026-11-16 (Bolt 4 Phase 1 + Phase 2 SHIPPED via autonomous execution. 134 real-world soft-deletes on Chris's Inbox, 20/20 ship-gate hit, 1 verify bug found + fixed mid-run, 4 exemption rules added from walk-through. Captain's log: `docs/captains_log/20261116-2230-bolt4-inbox-triage-shipped.md`.) Prior: 2026-03-27 (Bolt 3 close).
+**Last groomed:** 2026-11-19 (Bolt 7 JXA Recipient Fix + Chunked Scan SHIPPED. Unblocked behavioral rules — ignored-sender-cold + dead-thread-reference now fire SAFELY with working sent-context (3,546 sent msgs / 401 unique recipients scanned). Live validation: 149 safe-delete + 160 archive = 309 messages moved. Captain's log: `docs/captains_log/20261119-0720-bolt7-jxa-fix-shipped.md`.) Prior: 2026-11-19 (Bolt 6 Advanced Triage SHIPPED. 5 behavioral rules + List-Unsubscribe rule + LLM classifier + marketplace scan. Live-run: 141/141 verified-success, Inbox 1,425 → 1,313. Dangerous ignored-sender-cold bug found + fixed mid-run — empty sent-scan now treated as broken scan not "never replied". Captain's log: `docs/captains_log/20261119-0620-bolt6-advanced-triage-shipped.md`.) Prior: 2026-11-17 (Opened Bolt 5 — Phase 3 batching trigger met early. Observed 44% silent-success failure rate on 43-msg apply run, far exceeding acceptable reliability. B4.3.* graduating to B5.*. Spec: `docs/pm/plans/20261117-0740-bolt5-batching-plan.md`.) Prior: 2026-11-16 (Bolt 4 Phase 1 + Phase 2 SHIPPED via autonomous execution. 134 real-world soft-deletes on Chris's Inbox, 20/20 ship-gate hit, 1 verify bug found + fixed mid-run, 4 exemption rules added from walk-through. Captain's log: `docs/captains_log/20261116-2230-bolt4-inbox-triage-shipped.md`.) Prior: 2026-03-27 (Bolt 3 close).
 
 ## Completed
 
@@ -19,6 +19,9 @@
 | 18 | Bolt 6: Marketplace scan — zero Outlook plugins exist in Anthropic marketplace | Bolt 6 Phase A3 |
 | 19 | Bolt 6: List-Unsubscribe body rule + unread-junk gate + --llm wiring | Bolt 6 Phase B |
 | 20 | Bolt 6 live validation: 141/141 verified-success soft-deletes (1,425→1,313) | Bolt 6 Phase C |
+| 21 | Bolt 7: JXA recipient extraction fix (`emailAddress().address` property access) | Bolt 7 B7.1 |
+| 22 | Bolt 7: Chunked classifier scan (90-day windows, transparent to callers) | Bolt 7 B7.2 |
+| 23 | Bolt 7 live validation: 149 safe-delete + 160 resolved-ticket archive (309/309 verified) | Bolt 7 B7.3 |
 
 ## Prioritized Items
 
