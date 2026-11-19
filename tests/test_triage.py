@@ -421,14 +421,21 @@ class TestNewPatternRules:
     # ---- ignored-sender-cold -------------------------------------------
 
     def test_ignored_sender_cold_positive(self):
-        """Cold sender, > 60 days old, no reply from Chris → safe-delete."""
+        """Cold sender, > 60 days old, no reply from Chris → safe-delete.
+
+        sent_to_counts must be non-empty (scan ran successfully) but must not
+        contain the target sender. Empty dict means "scan broken, don't fire"
+        (fix from 2026-11-19 live validation).
+        """
         m = _msg(
             sender_email="rep@unknown-vendor.io",
             subject="Checking in on our last conversation",
             received_datetime=datetime.now() - timedelta(days=75),
         )
         ctx = {
-            "sent_to_counts": {},  # Chris has never written to this address
+            # Non-empty — proves the scan worked. Sender isn't in here, so
+            # Chris never wrote to them.
+            "sent_to_counts": {"someone-else@example.com": 3},
             "sender_counts": {"rep@unknown-vendor.io": 4},
         }
         assert triage_rules.classify(m, ctx) == (
@@ -551,7 +558,8 @@ class TestNewPatternRules:
             subject="Can I get 15 minutes?",
             received_datetime=datetime.now() - timedelta(days=45),
         )
-        ctx = {"sent_to_counts": {}}
+        # sent_to_counts must be non-empty — empty means scan broken, rule skips.
+        ctx = {"sent_to_counts": {"someone-else@example.com": 1}}
         assert triage_rules.classify(m, ctx) == (
             "safe-delete", "cold-outreach-dormant",
         )
@@ -563,7 +571,7 @@ class TestNewPatternRules:
             subject="Following up",
             received_datetime=datetime.now() - timedelta(days=60),
         )
-        ctx = {"sent_to_counts": {}}
+        ctx = {"sent_to_counts": {"someone-else@example.com": 1}}
         bucket, rule = triage_rules.classify(m, ctx)
         assert rule == "cold-outreach-dormant"
         assert bucket == "safe-delete"
@@ -1323,7 +1331,12 @@ class TestTriageClassifyInboxWiring:
 
     def test_sent_context_built_once_and_threaded(self):
         """build_sent_context must be called once; behavioral rules
-        (ignored-sender-cold) must see the context and fire."""
+        (ignored-sender-cold) must see the context and fire.
+
+        Sent folder must have at least one unrelated recipient — an empty
+        sent scan is treated as "scan broken" (fix from 2026-11-19 live
+        validation) and skips behavioral rules entirely.
+        """
         import triage  # noqa: WPS433
 
         # Inbox: 3 messages from a cold sender, > 60 days old, never replied.
@@ -1342,13 +1355,24 @@ class TestTriageClassifyInboxWiring:
             }
             for i in range(3)
         ]
-        client = self._client_with_inbox(inbox, sent=[])
+        # Sent folder has real engagement with somebody else — proves the
+        # scan works. The cold sender isn't among the recipients.
+        sent = [{
+            "id": "sent_1",
+            "sender_email": "cfossenier@membersolutions.com",
+            "to": "colleague@membersolutions.com",
+            "subject": "team sync",
+            "received_datetime": datetime.now() - timedelta(days=10),
+            "is_read": True,
+            "folder": "Sent Items",
+        }]
+        client = self._client_with_inbox(inbox, sent=sent)
         with patch("triage.OutlookClient", return_value=client):
             report = triage.classify_inbox(window_days=365, max_results=100)
 
         # At least one record must have matched ignored-sender-cold — the
         # volume floor (sender_counts >= 3) and the never-replied signal
-        # (sent_to_counts == {}) both must come from the context.
+        # (sent_to_counts has entries but not this sender) both come from context.
         matched_rules = [r["matched_rule"] for r in report["messages"]]
         assert "ignored-sender-cold" in matched_rules
 

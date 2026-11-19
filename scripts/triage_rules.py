@@ -320,15 +320,26 @@ def _matches_cold_outreach_domain(email: str) -> bool:
 
 
 def _sent_scan_available(context: Context) -> bool:
-    """True when a Sent Items scan was built for this run.
+    """True when a Sent Items scan returned USABLE data for this run.
 
     ``sent_to_counts`` is only present when :func:`build_sent_context`
     (or an equivalent) was called. Rules that depend on "did the operator
-    reply" must short-circuit when the scan wasn't done — otherwise they
-    would over-classify on the default ``classify(msg)`` path used by
-    existing callers.
+    reply" must short-circuit when:
+      - the scan wasn't done (key missing), OR
+      - the scan returned empty (JXA parse bug returned 0 recipients)
+
+    An empty dict means either "operator has sent zero emails ever" (not
+    plausible) or the recipient extraction is broken. Either way the rule
+    cannot distinguish "ignored" from "never asked," so we fail safe.
+
+    Learned 2026-11-19 Bolt 6 live validation: ``ignored-sender-cold``
+    fired 120× against real customer correspondence because
+    ``toRecipients()`` returned empty strings and the gate let it through.
     """
-    return bool(context and "sent_to_counts" in context)
+    if not context or "sent_to_counts" not in context:
+        return False
+    counts = context.get("sent_to_counts") or {}
+    return len(counts) > 0
 
 
 def _operator_has_replied(sender_email: str, context: Context) -> bool:
