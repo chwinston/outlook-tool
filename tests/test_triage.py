@@ -44,6 +44,7 @@ def _msg(
     is_read: bool = False,
     folder: str = "Inbox",
     to: str = "",
+    body_preview: str = "",
 ) -> dict:
     return {
         "id": message_id,
@@ -54,6 +55,7 @@ def _msg(
         "is_read": is_read,
         "folder": folder,
         "to": to,
+        "body_preview": body_preview,
     }
 
 
@@ -271,6 +273,57 @@ class TestTriageRules:
         assert bucket == "safe-delete"
         assert rule in ("marketing-sender", "unsubscribe-marketing")
 
+    # ---- Bolt 6 B.2 — list-unsubscribe-bulk (A3 marketplace-scan win) ---
+
+    def test_list_unsubscribe_bulk_from_body(self):
+        """A novel-domain sender with a classic unsubscribe-body marker
+        must land in safe-delete — this is the long-tail newsletter
+        catchment the rule was designed for."""
+        m = _msg(
+            sender_email="hello@novel-newsletter-domain-xyz.io",
+            subject="November Digest",
+            body_preview=(
+                "This is the November issue. Read more at the link. "
+                "You're receiving this because you signed up at example.com. "
+                "Unsubscribe here."
+            ),
+            received_datetime=datetime.now() - timedelta(days=2),
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert bucket == "safe-delete"
+        assert rule == "list-unsubscribe-bulk"
+
+    def test_list_unsubscribe_bulk_manage_preferences_marker(self):
+        """The 'manage preferences' variant must also match."""
+        m = _msg(
+            sender_email="updates@brand.example",
+            subject="Product update",
+            body_preview=(
+                "Here's what's new this month. Manage your email preferences "
+                "at the link below."
+            ),
+            received_datetime=datetime.now() - timedelta(days=5),
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert bucket == "safe-delete"
+        # marketing-sender might still win on senders with a marketing local
+        # part; here the sender is novel so list-unsubscribe-bulk should win.
+        assert rule == "list-unsubscribe-bulk"
+
+    def test_list_unsubscribe_bulk_requires_marker(self):
+        """A plain personal email with no unsubscribe marker must NOT
+        match this rule (precision guard)."""
+        m = _msg(
+            sender_email="friend@external-person.example",
+            subject="Dinner next week?",
+            body_preview="Hey, are you free for dinner next Thursday?",
+            received_datetime=datetime.now() - timedelta(days=1),
+        )
+        bucket, rule = triage_rules.classify(m)
+        # The "?" in subject lands it in needs-action via question-in-subject;
+        # the critical assertion is: list-unsubscribe-bulk must NOT fire.
+        assert rule != "list-unsubscribe-bulk"
+
     def test_generic_noreply_old(self):
         old = datetime.now() - timedelta(days=20)
         m = _msg(
@@ -287,6 +340,354 @@ class TestTriageRules:
             received_datetime=datetime.now() - timedelta(days=2),
         )
         assert triage_rules.classify(m) == ("keep", "default")
+
+
+# ===========================================================================
+# triage_rules.build_sent_context — Bolt 6 A1 sent-items helper
+# ===========================================================================
+
+class TestBuildSentContext:
+    """``build_sent_context`` scans Sent Items and returns a count-by-
+    recipient map used by the ``ignored-sender-cold`` rule."""
+
+    def _client_with_sent(self, sent_messages):
+        client = MagicMock()
+        client.search.return_value = sent_messages
+        return client
+
+    def test_builds_recipient_counts(self):
+        client = self._client_with_sent([
+            {"to": "alice@example.com"},
+            {"to": "alice@example.com, bob@example.com"},
+            {"to": "bob@example.com"},
+        ])
+        ctx = triage_rules.build_sent_context(client, days_lookback=30)
+        assert ctx["sent_to_counts"]["alice@example.com"] == 2
+        assert ctx["sent_to_counts"]["bob@example.com"] == 2
+        assert ctx["scanned_messages"] == 3
+        assert ctx["days_lookback"] == 30
+
+    def test_normalizes_case_and_whitespace(self):
+        client = self._client_with_sent([
+            {"to": "Alice@Example.COM"},
+            {"to": "  alice@example.com  "},
+        ])
+        ctx = triage_rules.build_sent_context(client)
+        assert ctx["sent_to_counts"]["alice@example.com"] == 2
+
+    def test_strips_angle_bracket_form(self):
+        client = self._client_with_sent([
+            {"to": "Alice <alice@example.com>"},
+        ])
+        ctx = triage_rules.build_sent_context(client)
+        assert ctx["sent_to_counts"].get("alice@example.com") == 1
+
+    def test_empty_to_field_ignored(self):
+        client = self._client_with_sent([
+            {"to": ""},
+            {"to": None},
+            {},
+        ])
+        ctx = triage_rules.build_sent_context(client)
+        assert ctx["sent_to_counts"] == {}
+        assert ctx["scanned_messages"] == 3
+
+    def test_search_called_with_sent_items(self):
+        client = self._client_with_sent([])
+        triage_rules.build_sent_context(
+            client, days_lookback=365, max_results=5000,
+        )
+        client.search.assert_called_once()
+        kwargs = client.search.call_args.kwargs
+        assert kwargs["folder"] == "Sent Items"
+        assert kwargs["max_results"] == 5000
+        assert "date_from" in kwargs
+        assert "date_to" in kwargs
+
+
+# ===========================================================================
+# Bolt 6 A1 — new behavioral pattern rules
+# ===========================================================================
+
+class TestNewPatternRules:
+    """Behavioral rules added in Bolt 6 Phase A1.
+
+    These rules require a per-run ``context`` dict (see
+    :func:`triage_rules.build_sent_context`). Each rule has at least a
+    positive test, a negative test, and an edge-case test that would
+    trip up a less careful implementation.
+    """
+
+    # ---- ignored-sender-cold -------------------------------------------
+
+    def test_ignored_sender_cold_positive(self):
+        """Cold sender, > 60 days old, no reply from Chris → safe-delete.
+
+        sent_to_counts must be non-empty (scan ran successfully) but must not
+        contain the target sender. Empty dict means "scan broken, don't fire"
+        (fix from 2026-11-19 live validation).
+        """
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Checking in on our last conversation",
+            received_datetime=datetime.now() - timedelta(days=75),
+        )
+        ctx = {
+            # Non-empty — proves the scan worked. Sender isn't in here, so
+            # Chris never wrote to them.
+            "sent_to_counts": {"someone-else@example.com": 3},
+            "sender_counts": {"rep@unknown-vendor.io": 4},
+        }
+        assert triage_rules.classify(m, ctx) == (
+            "safe-delete", "ignored-sender-cold",
+        )
+
+    def test_ignored_sender_cold_blocks_when_chris_replied(self):
+        """If Chris EVER replied, the rule must NOT fire."""
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Checking in on our last conversation",
+            received_datetime=datetime.now() - timedelta(days=75),
+        )
+        ctx = {
+            "sent_to_counts": {"rep@unknown-vendor.io": 1},
+            "sender_counts": {"rep@unknown-vendor.io": 4},
+        }
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "ignored-sender-cold"
+
+    def test_ignored_sender_cold_requires_age(self):
+        """Age < 60 days → rule must NOT fire even if never replied."""
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Quick follow-up",
+            received_datetime=datetime.now() - timedelta(days=30),
+        )
+        ctx = {
+            "sent_to_counts": {},
+            "sender_counts": {"rep@unknown-vendor.io": 4},
+        }
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "ignored-sender-cold"
+
+    def test_ignored_sender_cold_skips_internal(self):
+        """Internal sender must stay with internal-person, not get
+        auto-swept by the cold rule."""
+        m = _msg(
+            sender_email="coworker@membersolutions.com",
+            subject="Old update",
+            received_datetime=datetime.now() - timedelta(days=90),
+        )
+        ctx = {
+            "sent_to_counts": {},
+            "sender_counts": {"coworker@membersolutions.com": 10},
+        }
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule == "internal-person"
+        assert bucket == "needs-action"
+
+    def test_ignored_sender_cold_no_context_noop(self):
+        """Without a Sent-Items scan, the rule must NOT fire — preserves
+        backward compat for existing ``classify(msg)`` callers."""
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Checking in",
+            received_datetime=datetime.now() - timedelta(days=75),
+        )
+        bucket, rule = triage_rules.classify(m)  # no context
+        assert rule != "ignored-sender-cold"
+
+    def test_ignored_sender_cold_volume_floor_enforced(self):
+        """Volume floor: fewer than 3 inbox messages from this sender ⇒
+        rule must NOT fire (avoid false positives on one-off senders)."""
+        m = _msg(
+            sender_email="rep@unknown-vendor.io",
+            subject="Checking in",
+            received_datetime=datetime.now() - timedelta(days=75),
+        )
+        ctx = {
+            "sent_to_counts": {},
+            "sender_counts": {"rep@unknown-vendor.io": 1},
+        }
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "ignored-sender-cold"
+
+    # ---- dead-thread-reference -----------------------------------------
+
+    def test_dead_thread_reference_positive(self):
+        """Re: thread > 90 days old + Chris replied once → archive."""
+        m = _msg(
+            sender_email="vendor@external.com",
+            subject="Re: Contract Renewal Discussion",
+            received_datetime=datetime.now() - timedelta(days=120),
+        )
+        ctx = {"sent_to_counts": {"vendor@external.com": 2}}
+        assert triage_rules.classify(m, ctx) == (
+            "resolved-ticket", "dead-thread-reference",
+        )
+
+    def test_dead_thread_reference_requires_re_prefix(self):
+        """Fresh subject (no Re: chain) → rule must NOT fire."""
+        m = _msg(
+            sender_email="vendor@external.com",
+            subject="New Contract Proposal",
+            received_datetime=datetime.now() - timedelta(days=120),
+        )
+        ctx = {"sent_to_counts": {"vendor@external.com": 2}}
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "dead-thread-reference"
+
+    def test_dead_thread_reference_requires_chris_engagement(self):
+        """If Chris never wrote back, this is ignored-sender-cold
+        territory, not dead-thread."""
+        m = _msg(
+            sender_email="vendor@external.com",
+            subject="Re: Our product",
+            received_datetime=datetime.now() - timedelta(days=120),
+        )
+        ctx = {"sent_to_counts": {}}  # no reply
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "dead-thread-reference"
+
+    # ---- cold-outreach-dormant -----------------------------------------
+
+    def test_cold_outreach_dormant_positive(self):
+        """Known outbound-SaaS domain + no reply + > 30 days → safe-delete."""
+        m = _msg(
+            sender_email="hello@foo.outreach.io",
+            subject="Can I get 15 minutes?",
+            received_datetime=datetime.now() - timedelta(days=45),
+        )
+        # sent_to_counts must be non-empty — empty means scan broken, rule skips.
+        ctx = {"sent_to_counts": {"someone-else@example.com": 1}}
+        assert triage_rules.classify(m, ctx) == (
+            "safe-delete", "cold-outreach-dormant",
+        )
+
+    def test_cold_outreach_dormant_salesloft(self):
+        """SalesLoft subdomain matches the pattern."""
+        m = _msg(
+            sender_email="noreply@mail.salesloft.com",
+            subject="Following up",
+            received_datetime=datetime.now() - timedelta(days=60),
+        )
+        ctx = {"sent_to_counts": {"someone-else@example.com": 1}}
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule == "cold-outreach-dormant"
+        assert bucket == "safe-delete"
+
+    def test_cold_outreach_dormant_blocked_by_reply(self):
+        """Operator replied to the outreach sender → rule must NOT fire."""
+        m = _msg(
+            sender_email="hello@foo.outreach.io",
+            subject="Can I get 15 minutes?",
+            received_datetime=datetime.now() - timedelta(days=45),
+        )
+        ctx = {"sent_to_counts": {"hello@foo.outreach.io": 1}}
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "cold-outreach-dormant"
+
+    def test_cold_outreach_dormant_age_floor(self):
+        """Under 30 days → not dormant yet."""
+        m = _msg(
+            sender_email="hello@foo.outreach.io",
+            subject="Quick note",
+            received_datetime=datetime.now() - timedelta(days=15),
+        )
+        ctx = {"sent_to_counts": {}}
+        bucket, rule = triage_rules.classify(m, ctx)
+        assert rule != "cold-outreach-dormant"
+
+    # ---- bulk-marketing-tail -------------------------------------------
+
+    def test_bulk_marketing_tail_positive(self):
+        """Marketing-domain sender + unread + > 30 days → safe-delete."""
+        m = _msg(
+            sender_email="hello@birdeye.com",
+            subject="Monthly product update",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=False,
+        )
+        assert triage_rules.classify(m) == (
+            "safe-delete", "bulk-marketing-tail",
+        )
+
+    def test_bulk_marketing_tail_read_falls_through(self):
+        """Read marketing mail → generic marketing-sender rule wins,
+        bulk-marketing-tail must NOT claim it."""
+        m = _msg(
+            sender_email="hello@birdeye.com",
+            subject="Monthly product update",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=True,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert bucket == "safe-delete"
+        # Read mail must NOT be labelled bulk-marketing-tail.
+        assert rule != "bulk-marketing-tail"
+
+    def test_bulk_marketing_tail_age_floor(self):
+        """Fresh unread marketing → other rules may handle it, but NOT
+        this one (needs the 30-day cliff)."""
+        m = _msg(
+            sender_email="hello@birdeye.com",
+            subject="Monthly product update",
+            received_datetime=datetime.now() - timedelta(days=5),
+            is_read=False,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert rule != "bulk-marketing-tail"
+
+    # ---- unread-automation-30d -----------------------------------------
+
+    def test_unread_automation_30d_positive(self):
+        """Noreply automation + unread + > 30 days → safe-delete."""
+        m = _msg(
+            sender_email="noreply@unknown-saas.io",
+            subject="Your weekly report",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=False,
+        )
+        assert triage_rules.classify(m) == (
+            "safe-delete", "unread-automation-30d",
+        )
+
+    def test_unread_automation_30d_requires_unread(self):
+        """Read automation falls through to generic-noreply-old, NOT
+        unread-automation-30d."""
+        m = _msg(
+            sender_email="noreply@unknown-saas.io",
+            subject="Your weekly report",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=True,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert bucket == "safe-delete"
+        assert rule != "unread-automation-30d"
+
+    def test_unread_automation_30d_exemption_still_wins(self):
+        """Exemption rules sit higher: GCP at-risk must NOT get
+        swept into unread-automation-30d even when unread + old."""
+        m = _msg(
+            sender_email="CloudPlatform-noreply@google.com",
+            subject="Your Project: msi-web is at risk of suspension",
+            received_datetime=datetime.now() - timedelta(days=60),
+            is_read=False,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert rule == "gcp-project-at-risk"
+        assert bucket == "needs-action"
+
+    def test_unread_automation_30d_human_sender_not_matched(self):
+        """Human sender (not noreply/notifications) → rule must NOT fire."""
+        m = _msg(
+            sender_email="jane.doe@partner.co",
+            subject="Checking in",
+            received_datetime=datetime.now() - timedelta(days=45),
+            is_read=False,
+        )
+        bucket, rule = triage_rules.classify(m)
+        assert rule != "unread-automation-30d"
 
 
 # ===========================================================================
@@ -707,3 +1108,585 @@ class TestApplyTriageBulkPath:
                 str(report), "--bucket", "safe-delete", "--apply",
             ])
         assert rc == 1
+
+
+# ===========================================================================
+# Bolt 6 Phase B.3 — apply_triage.apply_unread_junk_gate re-route
+# ===========================================================================
+
+
+class TestUnreadJunkGate:
+    """``apply_unread_junk_gate`` upgrades unread + high-confidence-junk
+    messages from the archivable buckets (resolved-ticket /
+    low-signal-client) or ``keep`` into ``safe-delete``. Mirrors Chris's
+    'unread + junk = delete' heuristic (Bolt 6 Phase B.3)."""
+
+    def _msg_rec(
+        self,
+        *,
+        message_id: str = "as_msg_1",
+        bucket: str = "keep",
+        is_read: bool = False,
+        llm_bucket: str | None = None,
+        llm_confidence: float | None = None,
+        matched_rule: str = "default",
+    ) -> dict:
+        rec = {
+            "message_id": message_id,
+            "sender_email": "x@y.com",
+            "subject": "s",
+            "received_at": datetime.now().isoformat(),
+            "bucket": bucket,
+            "is_read": is_read,
+            "matched_rule": matched_rule,
+            "body_preview": "",
+        }
+        if llm_bucket is not None:
+            rec["llm_verdict"] = {
+                "bucket": llm_bucket,
+                "confidence": llm_confidence if llm_confidence is not None else 0.0,
+                "reason": "test",
+                "route": "auto",
+            }
+        return rec
+
+    def _report(self, messages: list) -> dict:
+        return {
+            "schema_version": 1,
+            "generated_at": datetime.now().isoformat(),
+            "backend": "applescript",
+            "sample_folder": "Inbox",
+            "sample_size": len(messages),
+            "window_days": 30,
+            "summary": {b: 0 for b in triage_rules.BUCKETS},
+            "messages": messages,
+        }
+
+    def test_keep_unread_high_confidence_junk_upgrades_to_safe_delete(self):
+        """Classic shape: rules left it as keep, LLM says junk at 0.9,
+        unread → upgrade."""
+        rec = self._msg_rec(
+            bucket="keep", is_read=False,
+            llm_bucket="junk", llm_confidence=0.9,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "safe-delete"
+        assert new_report["messages"][0]["matched_rule"] == "unread-junk-upgrade"
+        assert new_report["messages"][0]["unread_junk_upgrade"]["from_bucket"] == "keep"
+        assert new_report["unread_junk_upgrades"] == 1
+
+    def test_resolved_ticket_unread_junk_upgrades(self):
+        """resolved-ticket is in the upgradable set — unread + junk
+        should move it to safe-delete."""
+        rec = self._msg_rec(
+            bucket="resolved-ticket", is_read=False,
+            llm_bucket="junk", llm_confidence=0.95,
+            matched_rule="hubspot-ticket-comment",
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "safe-delete"
+        assert new_report["messages"][0]["unread_junk_upgrade"]["from_rule"] == "hubspot-ticket-comment"
+
+    def test_low_signal_client_unread_junk_upgrades(self):
+        """low-signal-client is also in the upgradable set."""
+        rec = self._msg_rec(
+            bucket="low-signal-client", is_read=False,
+            llm_bucket="junk", llm_confidence=0.88,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "safe-delete"
+
+    def test_read_junk_does_not_upgrade(self):
+        """Read messages must NOT be upgraded (Chris's rule requires unread)."""
+        rec = self._msg_rec(
+            bucket="keep", is_read=True,
+            llm_bucket="junk", llm_confidence=0.95,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "keep"
+        assert new_report["unread_junk_upgrades"] == 0
+
+    def test_low_confidence_junk_does_not_upgrade(self):
+        """Confidence < 0.85 → no upgrade."""
+        rec = self._msg_rec(
+            bucket="keep", is_read=False,
+            llm_bucket="junk", llm_confidence=0.70,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "keep"
+        assert new_report["unread_junk_upgrades"] == 0
+
+    def test_non_junk_llm_verdict_does_not_upgrade(self):
+        """LLM says 'reference' at high confidence → NOT a delete signal."""
+        rec = self._msg_rec(
+            bucket="keep", is_read=False,
+            llm_bucket="reference", llm_confidence=0.95,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "keep"
+
+    def test_needs_action_bucket_protected_from_upgrade(self):
+        """needs-action messages must NOT be touched — the point is to
+        protect action signal from being swept to safe-delete even when
+        the LLM screws up and calls them junk."""
+        rec = self._msg_rec(
+            bucket="needs-action", is_read=False,
+            llm_bucket="junk", llm_confidence=0.95,
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "needs-action"
+        assert new_report["unread_junk_upgrades"] == 0
+
+    def test_safe_delete_bucket_unchanged(self):
+        """Already-safe-delete stays put — gate only upgrades, never
+        downgrades."""
+        rec = self._msg_rec(
+            bucket="safe-delete", is_read=False,
+            llm_bucket="junk", llm_confidence=0.95,
+            matched_rule="marketing-sender",
+        )
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["matched_rule"] == "marketing-sender"
+        assert new_report["unread_junk_upgrades"] == 0
+
+    def test_summary_recounted_after_upgrade(self):
+        """When the gate fires, the summary block must reflect the new
+        bucket distribution."""
+        messages = [
+            self._msg_rec(message_id="a", bucket="keep", is_read=False,
+                          llm_bucket="junk", llm_confidence=0.9),
+            self._msg_rec(message_id="b", bucket="keep", is_read=True,
+                          llm_bucket="junk", llm_confidence=0.9),
+            self._msg_rec(message_id="c", bucket="needs-action", is_read=False),
+        ]
+        new_report = apply_triage.apply_unread_junk_gate(self._report(messages))
+        assert new_report["summary"]["safe-delete"] == 1
+        assert new_report["summary"]["keep"] == 1
+        assert new_report["summary"]["needs-action"] == 1
+
+    def test_message_without_llm_verdict_unchanged(self):
+        """No llm_verdict attached → gate has nothing to act on; passes through."""
+        rec = self._msg_rec(bucket="keep", is_read=False)
+        new_report = apply_triage.apply_unread_junk_gate(self._report([rec]))
+        assert new_report["messages"][0]["bucket"] == "keep"
+        assert "unread_junk_upgrade" not in new_report["messages"][0]
+
+
+# ===========================================================================
+# Bolt 6 Phase B.1 — triage.py wiring (context, body_preview, --llm)
+# ===========================================================================
+
+
+class TestTriageClassifyInboxWiring:
+    """Phase B.1 — triage.classify_inbox must thread sent-items context
+    into every classify() call and preserve body_preview + is_read on the
+    projected report so the LLM gate has what it needs.
+    """
+
+    def _client_with_inbox(
+        self,
+        inbox: list,
+        sent: list | None = None,
+    ):
+        """Mock an OutlookClient. Inbox vs. Sent Items branches on folder kwarg."""
+        import triage  # noqa: WPS433 — local import for patching
+
+        sent = sent or []
+        client = MagicMock()
+        client.backend = "applescript"
+
+        def _search(**kwargs):
+            folder = kwargs.get("folder") or "Inbox"
+            if folder == "Sent Items":
+                return sent
+            return inbox
+
+        client.search.side_effect = _search
+        return client
+
+    def test_body_preview_and_is_read_in_projection(self):
+        """A classified record must include body_preview + is_read so the
+        downstream LLM gate (triage_llm) can read them."""
+        import triage  # noqa: WPS433
+
+        inbox = [
+            {
+                "id": "as_msg_1",
+                "sender_email": "x@y.com",
+                "sender_name": "X",
+                "subject": "hello",
+                "received_datetime": datetime.now() - timedelta(days=2),
+                "is_read": False,
+                "body_preview": "Please take a look at this.",
+                "folder": "Inbox",
+            },
+        ]
+        client = self._client_with_inbox(inbox)
+        with patch("triage.OutlookClient", return_value=client):
+            report = triage.classify_inbox(window_days=30, max_results=10)
+        assert report["sample_size"] == 1
+        rec = report["messages"][0]
+        assert rec["body_preview"] == "Please take a look at this."
+        assert rec["is_read"] is False
+
+    def test_sent_context_built_once_and_threaded(self):
+        """build_sent_context must be called once; behavioral rules
+        (ignored-sender-cold) must see the context and fire.
+
+        Sent folder must have at least one unrelated recipient — an empty
+        sent scan is treated as "scan broken" (fix from 2026-11-19 live
+        validation) and skips behavioral rules entirely.
+        """
+        import triage  # noqa: WPS433
+
+        # Inbox: 3 messages from a cold sender, > 60 days old, never replied.
+        # This is the ignored-sender-cold shape.
+        old = datetime.now() - timedelta(days=90)
+        inbox = [
+            {
+                "id": f"as_msg_{i}",
+                "sender_email": "rep@unknown-vendor.io",
+                "sender_name": "rep",
+                "subject": f"ping {i}",
+                "received_datetime": old,
+                "is_read": True,
+                "body_preview": "",
+                "folder": "Inbox",
+            }
+            for i in range(3)
+        ]
+        # Sent folder has real engagement with somebody else — proves the
+        # scan works. The cold sender isn't among the recipients.
+        sent = [{
+            "id": "sent_1",
+            "sender_email": "cfossenier@membersolutions.com",
+            "to": "colleague@membersolutions.com",
+            "subject": "team sync",
+            "received_datetime": datetime.now() - timedelta(days=10),
+            "is_read": True,
+            "folder": "Sent Items",
+        }]
+        client = self._client_with_inbox(inbox, sent=sent)
+        with patch("triage.OutlookClient", return_value=client):
+            report = triage.classify_inbox(window_days=365, max_results=100)
+
+        # At least one record must have matched ignored-sender-cold — the
+        # volume floor (sender_counts >= 3) and the never-replied signal
+        # (sent_to_counts has entries but not this sender) both come from context.
+        matched_rules = [r["matched_rule"] for r in report["messages"]]
+        assert "ignored-sender-cold" in matched_rules
+
+        # Sanity: the report's sent_context block records the scan.
+        assert "sent_context" in report
+        assert report["sent_context"]["days_lookback"] == 365
+
+    def test_sent_context_handles_empty_sent_folder(self):
+        """A zero-result Sent Items scan must not crash the pipeline."""
+        import triage  # noqa: WPS433
+
+        inbox = [{
+            "id": "as_msg_1",
+            "sender_email": "x@y.com",
+            "sender_name": "X",
+            "subject": "hello",
+            "received_datetime": datetime.now(),
+            "is_read": True,
+            "body_preview": "",
+            "folder": "Inbox",
+        }]
+        client = self._client_with_inbox(inbox, sent=[])
+        with patch("triage.OutlookClient", return_value=client):
+            report = triage.classify_inbox(window_days=30, max_results=10)
+        assert report["sample_size"] == 1
+        assert report["sent_context"]["scanned_messages"] == 0
+
+    def test_llm_flag_calls_classify_messages_with_llm_only_for_keep(self):
+        """--llm must only send keep-bucket messages to the LLM; the gate
+        is additive (never overwrites bucket / matched_rule)."""
+        import triage  # noqa: WPS433
+
+        # Inbox: 2 marketing msgs (rules → safe-delete) + 1 generic keep msg.
+        now = datetime.now()
+        inbox = [
+            {
+                "id": "as_msg_1",
+                "sender_email": "hello@birdeye.com",
+                "sender_name": "Birdeye",
+                "subject": "promo",
+                "received_datetime": now,
+                "is_read": True,
+                "body_preview": "Monthly product update from Birdeye",
+                "folder": "Inbox",
+            },
+            {
+                "id": "as_msg_2",
+                "sender_email": "person@random.com",
+                "sender_name": "Person",
+                "subject": "random subject",
+                "received_datetime": now,
+                "is_read": False,
+                "body_preview": "Hey, interesting article you might like",
+                "folder": "Inbox",
+            },
+        ]
+        client = self._client_with_inbox(inbox, sent=[])
+
+        def fake_llm(messages, **_kw):
+            out = []
+            for m in messages:
+                new = dict(m)
+                new["llm_verdict"] = {
+                    "bucket": "junk",
+                    "confidence": 0.9,
+                    "reason": "mock",
+                    "route": "auto",
+                }
+                out.append(new)
+            return out
+
+        with patch("triage.OutlookClient", return_value=client):
+            with patch(
+                "triage_llm.classify_messages_with_llm",
+                side_effect=fake_llm,
+            ) as mock_llm:
+                report = triage.classify_inbox(
+                    window_days=30, max_results=10, use_llm=True,
+                    llm_limit=50,
+                )
+
+        # LLM must have been called exactly once.
+        assert mock_llm.call_count == 1
+        # The messages passed must all be bucket=="keep".
+        passed_msgs = mock_llm.call_args.args[0]
+        assert all(m["bucket"] == "keep" for m in passed_msgs)
+        # One keep message in our inbox ⇒ one message sent.
+        assert len(passed_msgs) == 1
+
+        # Keep message should now carry llm_verdict; safe-delete must not.
+        by_id = {m["message_id"]: m for m in report["messages"]}
+        assert by_id["as_msg_2"]["bucket"] == "keep"
+        assert by_id["as_msg_2"]["llm_verdict"]["bucket"] == "junk"
+        assert "llm_verdict" not in by_id["as_msg_1"]
+        # Report-level llm_summary present.
+        assert report["llm_summary"]["verdicts_added"] == 1
+        assert report["llm_summary"]["keep_candidates"] == 1
+
+    def test_llm_flag_absent_skips_llm_entirely(self):
+        """Without --llm, triage_llm must not even be imported-resolved."""
+        import triage  # noqa: WPS433
+
+        inbox = [{
+            "id": "as_msg_1",
+            "sender_email": "x@y.com",
+            "sender_name": "X",
+            "subject": "hello",
+            "received_datetime": datetime.now(),
+            "is_read": False,
+            "body_preview": "",
+            "folder": "Inbox",
+        }]
+        client = self._client_with_inbox(inbox, sent=[])
+        with patch("triage.OutlookClient", return_value=client):
+            with patch(
+                "triage_llm.classify_messages_with_llm",
+            ) as mock_llm:
+                report = triage.classify_inbox(window_days=30, max_results=10)
+        mock_llm.assert_not_called()
+        assert "llm_summary" not in report
+
+
+# ===========================================================================
+# Bolt 6 Phase B.4 — end-to-end smoke test
+# ===========================================================================
+
+
+class TestBolt6EndToEndSmoke:
+    """One integration test that exercises the full Bolt 6 pipeline
+    without touching Outlook or Anthropic: rules path produces a mixed
+    report, the unread-junk gate re-routes LLM-flagged messages, and
+    apply_triage renders the correct final-state preview under --no-apply.
+
+    Covers the three canonical shapes:
+      1. rule-matched junk (safe-delete via marketing-sender) — untouched
+         by LLM, untouched by gate.
+      2. keep + LLM-junk + unread — upgraded by the gate to safe-delete.
+      3. keep + no LLM verdict — stays as keep (gate silent).
+    """
+
+    def test_full_pipeline_dry_run(self, tmp_path, capsys):
+        import triage  # noqa: WPS433
+
+        now = datetime.now()
+        inbox = [
+            # #1: rule-matched junk — marketing-sender fires in triage_rules.
+            {
+                "id": "as_msg_rule_junk",
+                "sender_email": "hello@birdeye.com",
+                "sender_name": "Birdeye",
+                "subject": "[2026 Report] The State of AI Search",
+                "received_datetime": now - timedelta(days=2),
+                "is_read": True,
+                "body_preview": "A promotional email from Birdeye.",
+                "folder": "Inbox",
+            },
+            # #2: rules → keep, LLM will label junk at 0.9, unread → gate
+            # upgrades to safe-delete.
+            {
+                "id": "as_msg_llm_junk",
+                "sender_email": "random-person@random-example.co",
+                "sender_name": "Random Person",
+                "subject": "Quick note",
+                "received_datetime": now - timedelta(days=1),
+                "is_read": False,
+                "body_preview": "Ignore this — just saying hi.",
+                "folder": "Inbox",
+            },
+            # #3: rules → keep, no LLM verdict → stays as keep.
+            {
+                "id": "as_msg_no_verdict",
+                "sender_email": "important@partner.com",
+                "sender_name": "Important Partner",
+                "subject": "Contract details",
+                "received_datetime": now - timedelta(days=1),
+                "is_read": False,
+                "body_preview": "Please find the attached contract.",
+                "folder": "Inbox",
+            },
+        ]
+
+        client = MagicMock()
+        client.backend = "applescript"
+
+        def _search(**kwargs):
+            folder = kwargs.get("folder") or "Inbox"
+            if folder == "Sent Items":
+                return []
+            return inbox
+
+        client.search.side_effect = _search
+
+        def fake_llm(messages, **_kw):
+            out = []
+            for m in messages:
+                new = dict(m)
+                if m["message_id"] == "as_msg_llm_junk":
+                    new["llm_verdict"] = {
+                        "bucket": "junk",
+                        "confidence": 0.9,
+                        "reason": "mock",
+                        "route": "auto",
+                    }
+                # as_msg_no_verdict gets no verdict attached
+                out.append(new)
+            return out
+
+        # Run classify + LLM to build a complete report.
+        with patch("triage.OutlookClient", return_value=client):
+            with patch(
+                "triage_llm.classify_messages_with_llm",
+                side_effect=fake_llm,
+            ):
+                report = triage.classify_inbox(
+                    window_days=30, max_results=10,
+                    use_llm=True, llm_limit=10,
+                )
+
+        # Pre-gate assertions: rules + LLM worked.
+        by_id_pre = {m["message_id"]: m for m in report["messages"]}
+        assert by_id_pre["as_msg_rule_junk"]["bucket"] == "safe-delete"
+        assert by_id_pre["as_msg_rule_junk"]["matched_rule"] in (
+            "marketing-sender", "list-unsubscribe-bulk",
+        )
+        assert by_id_pre["as_msg_llm_junk"]["bucket"] == "keep"
+        assert by_id_pre["as_msg_llm_junk"]["llm_verdict"]["bucket"] == "junk"
+        assert by_id_pre["as_msg_no_verdict"]["bucket"] == "keep"
+        assert "llm_verdict" not in by_id_pre["as_msg_no_verdict"]
+
+        # Write the report; have apply_triage's main() dry-run against it.
+        report_path = tmp_path / "triage.json"
+        report_path.write_text(json.dumps(report, indent=2, default=str))
+
+        with patch("apply_triage.OutlookClient") as mock_cls:
+            rc = apply_triage.main([
+                str(report_path), "--bucket", "safe-delete",
+            ])
+
+        # Dry-run → no client instantiated, exit 0.
+        mock_cls.assert_not_called()
+        assert rc == 0
+
+        out = capsys.readouterr().out
+
+        # The gate fired during main() — the Markdown preview must show
+        # BOTH the rule-matched junk AND the upgraded keep message in
+        # the safe-delete bucket.
+        assert "Triage Preview — safe-delete bucket (2 messages)" in out
+        assert "hello@birdeye.com" in out
+        assert "random-person@random-example.co" in out
+        # Provenance: the upgraded row must carry unread-junk-upgrade.
+        assert "unread-junk-upgrade" in out
+        # The untouched keep message must NOT appear in safe-delete preview.
+        assert "important@partner.com" not in out
+
+    def test_full_pipeline_no_unread_junk_rule_flag_keeps_keep_bucket(
+        self, tmp_path, capsys,
+    ):
+        """With --no-unread-junk-rule, the gate must NOT upgrade the LLM-
+        flagged keep-junk message — it stays in keep."""
+        import triage  # noqa: WPS433
+
+        now = datetime.now()
+        inbox = [{
+            "id": "as_msg_llm_junk",
+            "sender_email": "random-person@random-example.co",
+            "sender_name": "Random Person",
+            "subject": "Quick note",
+            "received_datetime": now - timedelta(days=1),
+            "is_read": False,
+            "body_preview": "Ignore this.",
+            "folder": "Inbox",
+        }]
+        client = MagicMock()
+        client.backend = "applescript"
+        client.search.side_effect = (
+            lambda **kw: [] if kw.get("folder") == "Sent Items" else inbox
+        )
+
+        def fake_llm(messages, **_kw):
+            out = []
+            for m in messages:
+                new = dict(m)
+                new["llm_verdict"] = {
+                    "bucket": "junk",
+                    "confidence": 0.95,
+                    "reason": "mock",
+                    "route": "auto",
+                }
+                out.append(new)
+            return out
+
+        with patch("triage.OutlookClient", return_value=client):
+            with patch(
+                "triage_llm.classify_messages_with_llm",
+                side_effect=fake_llm,
+            ):
+                report = triage.classify_inbox(
+                    window_days=30, max_results=10,
+                    use_llm=True, llm_limit=10,
+                )
+
+        report_path = tmp_path / "triage.json"
+        report_path.write_text(json.dumps(report, indent=2, default=str))
+
+        with patch("apply_triage.OutlookClient"):
+            rc = apply_triage.main([
+                str(report_path),
+                "--bucket", "safe-delete",
+                "--no-unread-junk-rule",
+            ])
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Message stayed in keep bucket, so safe-delete preview is empty.
+        assert "Triage Preview — safe-delete bucket (0 messages)" in out
+        assert "random-person@random-example.co" not in out

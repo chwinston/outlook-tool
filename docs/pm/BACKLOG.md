@@ -1,6 +1,6 @@
 # Backlog
 
-**Last groomed:** 2026-11-17 (Opened Bolt 5 — Phase 3 batching trigger met early. Observed 44% silent-success failure rate on 43-msg apply run, far exceeding acceptable reliability. B4.3.* graduating to B5.*. Spec: `docs/pm/plans/20261117-0740-bolt5-batching-plan.md`.) Prior: 2026-11-16 (Bolt 4 Phase 1 + Phase 2 SHIPPED via autonomous execution. 134 real-world soft-deletes on Chris's Inbox, 20/20 ship-gate hit, 1 verify bug found + fixed mid-run, 4 exemption rules added from walk-through. Captain's log: `docs/captains_log/20261116-2230-bolt4-inbox-triage-shipped.md`.) Prior: 2026-03-27 (Bolt 3 close).
+**Last groomed:** 2026-11-19 (Bolt 6 Advanced Triage SHIPPED. 5 behavioral rules + List-Unsubscribe rule + LLM classifier + marketplace scan. Live-run: 141/141 verified-success, Inbox 1,425 → 1,313. Dangerous ignored-sender-cold bug found + fixed mid-run — empty sent-scan now treated as broken scan not "never replied". Captain's log: `docs/captains_log/20261119-0620-bolt6-advanced-triage-shipped.md`.) Prior: 2026-11-17 (Opened Bolt 5 — Phase 3 batching trigger met early. Observed 44% silent-success failure rate on 43-msg apply run, far exceeding acceptable reliability. B4.3.* graduating to B5.*. Spec: `docs/pm/plans/20261117-0740-bolt5-batching-plan.md`.) Prior: 2026-11-16 (Bolt 4 Phase 1 + Phase 2 SHIPPED via autonomous execution. 134 real-world soft-deletes on Chris's Inbox, 20/20 ship-gate hit, 1 verify bug found + fixed mid-run, 4 exemption rules added from walk-through. Captain's log: `docs/captains_log/20261116-2230-bolt4-inbox-triage-shipped.md`.) Prior: 2026-03-27 (Bolt 3 close).
 
 ## Completed
 
@@ -13,6 +13,12 @@
 | 12 | Write verbs: move / delete / mark-read across 3 backends with OperationResult contract | Bolt 4 Phase 1 |
 | 13 | `/inbox-triage` skill: classifier + executor + 23 rules + operator manual | Bolt 4 Phase 2 |
 | 14 | Live validation: 134 real soft-deletes on Chris's Inbox (266→132) | Bolt 4 Phase 2 |
+| 15 | Bolt 5: bulk-move primitive + silent-success fix. 6/6 verified on live sweep | Bolt 5 |
+| 16 | Bolt 6: 5 behavioral rules (ignored-sender, dead-thread, cold-outreach, bulk-marketing-tail, unread-automation) | Bolt 6 Phase A1 |
+| 17 | Bolt 6: Claude Haiku LLM classifier module (29 mocked tests) | Bolt 6 Phase A2 |
+| 18 | Bolt 6: Marketplace scan — zero Outlook plugins exist in Anthropic marketplace | Bolt 6 Phase A3 |
+| 19 | Bolt 6: List-Unsubscribe body rule + unread-junk gate + --llm wiring | Bolt 6 Phase B |
+| 20 | Bolt 6 live validation: 141/141 verified-success soft-deletes (1,425→1,313) | Bolt 6 Phase C |
 
 ## Prioritized Items
 
