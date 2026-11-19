@@ -1187,3 +1187,46 @@ class TestParseAsMsgIndex:
 # =============================================================================
 
 integration = pytest.mark.integration
+
+
+# =============================================================================
+# Bolt 7 — JXA recipient extraction integration test
+# =============================================================================
+
+@pytest.mark.integration
+@pytest.mark.skipif(not HAS_APPLESCRIPT, reason="AppleScript backend unavailable")
+class TestJXARecipientExtractionIntegration:
+    """Bolt 7 fix: JXA toRecipients() required emailAddress() accessor,
+    not address(). This test hits the real Outlook Sent Items folder and
+    asserts at least one message has a non-empty `to` field — proof the
+    accessor chain works end-to-end.
+
+    Gated by `-m integration`; deselected by default."""
+
+    def test_sent_items_has_non_empty_to_field(self):
+        from outlook_tool import _AppleScriptBackend
+        from datetime import datetime, timedelta
+
+        backend = _AppleScriptBackend()
+        results = backend.scan_emails(
+            start_date=datetime.now() - timedelta(days=365),
+            end_date=datetime.now(),
+            max_results=20,
+            folder_name="Sent Items",
+        )
+        if not results:
+            pytest.skip("No sent messages in the last year to test against")
+
+        non_empty_to = [r for r in results if r.get("to", "").strip()]
+        assert len(non_empty_to) > 0, (
+            "Expected at least one Sent-Items message to have a non-empty "
+            "`to` field after Bolt 7 fix. If this fails, the JXA recipient "
+            "accessor regressed — likely msg.toRecipients()[k].emailAddress() "
+            "is no longer returning {name,address,type}."
+        )
+        # At least one should contain an @
+        has_atsign = any("@" in r["to"] for r in non_empty_to)
+        assert has_atsign, (
+            "Non-empty `to` fields found but none contain `@` — recipient "
+            "address parsing is broken."
+        )

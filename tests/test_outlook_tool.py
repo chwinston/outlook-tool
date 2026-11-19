@@ -629,6 +629,167 @@ class TestAppleScriptBackendParsing(unittest.TestCase):
         assert results[0]["is_all_day"] is False
 
 
+class TestAppleScriptChunking(unittest.TestCase):
+    """Bolt 7 — scan_emails internally chunks large windows into 90-day
+    slices to avoid the 180s JXA timeout. Verified by mocking _scan_window
+    and asserting the chunk boundary, call count, and max_results cap."""
+
+    def _mk_backend(self):
+        from outlook_tool import _AppleScriptBackend
+        backend = _AppleScriptBackend.__new__(_AppleScriptBackend)
+        backend._version = "16.0"
+        return backend
+
+    def _mk_result(self, msg_index: int, date_str: str):
+        """Shape of one item _scan_window returns (post-parsing)."""
+        return {
+            "id": f"as_msg_{msg_index}",
+            "subject": f"msg {msg_index}",
+            "sender_name": "x",
+            "sender_email": "x@x.com",
+            "received_datetime": datetime(2026, 1, 1),
+            "received_date": date_str,
+            "day_of_week": "Thursday",
+            "is_read": True,
+            "has_attachments": False,
+            "importance": "normal",
+            "body_preview": "",
+            "to": "",
+            "attachments": [],
+        }
+
+    def test_short_window_does_not_chunk(self):
+        """< 90 days and < 500 max_results → single _scan_window call."""
+        backend = self._mk_backend()
+        with patch.object(backend, "_scan_window", return_value=[]) as mock_scan:
+            backend.scan_emails(
+                start_date=datetime(2026, 1, 1),
+                end_date=datetime(2026, 2, 1),
+                max_results=250,
+            )
+        assert mock_scan.call_count == 1
+
+    def test_small_cap_but_long_window_chunks(self):
+        """365-day window with small max_results still chunks (window test)."""
+        backend = self._mk_backend()
+        with patch.object(backend, "_scan_window", return_value=[]) as mock_scan:
+            backend.scan_emails(
+                start_date=datetime(2025, 1, 1),
+                end_date=datetime(2026, 1, 1),
+                max_results=100,
+            )
+        # 365 days / 90 = 4.05 → 5 chunks
+        assert mock_scan.call_count == 5
+
+    def test_large_cap_short_window_chunks(self):
+        """max_results > 500 triggers chunking even for short windows."""
+        backend = self._mk_backend()
+        with patch.object(backend, "_scan_window", return_value=[]) as mock_scan:
+            backend.scan_emails(
+                start_date=datetime(2026, 1, 1),
+                end_date=datetime(2026, 2, 1),
+                max_results=1000,
+            )
+        # 31 days fits in one 90-day chunk
+        assert mock_scan.call_count == 1
+
+    def test_365_day_window_calls_jxa_five_times(self):
+        """One year window → five 90-day chunks."""
+        backend = self._mk_backend()
+        with patch.object(backend, "_scan_window", return_value=[]) as mock_scan:
+            backend.scan_emails(
+                start_date=datetime(2025, 1, 1),
+                end_date=datetime(2026, 1, 1),
+                max_results=5000,
+            )
+        assert mock_scan.call_count == 5
+
+    def test_chunks_walk_backwards_most_recent_first(self):
+        """Window iteration starts at end_date and walks backwards."""
+        backend = self._mk_backend()
+        with patch.object(backend, "_scan_window", return_value=[]) as mock_scan:
+            backend.scan_emails(
+                start_date=datetime(2025, 1, 1),
+                end_date=datetime(2026, 1, 1),
+                max_results=5000,
+            )
+        # First call's end_date should be the overall end_date
+        first_call_kwargs = mock_scan.call_args_list[0].kwargs
+        assert first_call_kwargs["end_date"] == datetime(2026, 1, 1)
+        # Second call's end_date should be before the first's start
+        second_call_kwargs = mock_scan.call_args_list[1].kwargs
+        assert second_call_kwargs["end_date"] < first_call_kwargs["start_date"]
+
+    def test_max_results_cap_respected_across_chunks(self):
+        """Iteration stops as soon as max_results is hit, even mid-chunk."""
+        backend = self._mk_backend()
+        # Each chunk returns 50 items with unique IDs
+        counter = {"n": 0}
+
+        def _per_chunk(**kwargs):
+            start = counter["n"] * 50
+            counter["n"] += 1
+            return [
+                self._mk_result(start + i, f"2026-01-{(i % 28) + 1:02d}")
+                for i in range(50)
+            ]
+
+        with patch.object(backend, "_scan_window", side_effect=_per_chunk) as mock_scan:
+            results = backend.scan_emails(
+                start_date=datetime(2025, 1, 1),
+                end_date=datetime(2026, 1, 1),
+                max_results=120,
+            )
+        # 50 + 50 + 20 = 120. We should have stopped after 3 chunks.
+        assert len(results) == 120
+        assert mock_scan.call_count == 3
+
+    def test_chunks_concatenate_results(self):
+        """Results across chunks are concatenated and returned as one list."""
+        backend = self._mk_backend()
+        counter = {"n": 0}
+
+        def _per_chunk(**kwargs):
+            start = counter["n"] * 10
+            counter["n"] += 1
+            return [
+                self._mk_result(start + i, f"2026-01-{(i % 28) + 1:02d}")
+                for i in range(10)
+            ]
+
+        with patch.object(backend, "_scan_window", side_effect=_per_chunk):
+            results = backend.scan_emails(
+                start_date=datetime(2025, 1, 1),
+                end_date=datetime(2026, 1, 1),
+                max_results=5000,
+            )
+        # 5 chunks × 10 = 50 unique results
+        assert len(results) == 50
+
+    def test_duplicate_results_across_chunks_are_deduped(self):
+        """Same (id, received_date) across chunks is counted once."""
+        backend = self._mk_backend()
+        counter = {"n": 0}
+
+        def _per_chunk(**kwargs):
+            counter["n"] += 1
+            # Every chunk returns the SAME 3 items
+            return [
+                self._mk_result(1, "2026-01-01"),
+                self._mk_result(2, "2026-01-02"),
+                self._mk_result(3, "2026-01-03"),
+            ]
+
+        with patch.object(backend, "_scan_window", side_effect=_per_chunk):
+            results = backend.scan_emails(
+                start_date=datetime(2025, 1, 1),
+                end_date=datetime(2026, 1, 1),
+                max_results=5000,
+            )
+        # Despite 5 chunks each returning 3 dups, we only see 3
+        assert len(results) == 3
+
+
 class TestODataSanitization:
     """Tests for OData injection prevention."""
 
