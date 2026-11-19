@@ -388,7 +388,14 @@ class _AppleScriptBackend:
                         var recipients = msg.toRecipients();
                         var addrs = [];
                         for (var k = 0; k < recipients.length; k++) {{
-                            try {{ addrs.push(recipients[k].address()); }} catch(e) {{}}
+                            try {{
+                                // JXA quirk: recipient objects expose scalar attrs
+                                // only via emailAddress(), which returns
+                                // {{name, address, type}}. The old recipients[k].address()
+                                // call returned empty strings. See Bolt 7.
+                                var ea = recipients[k].emailAddress();
+                                if (ea && ea.address) addrs.push(ea.address);
+                            }} catch(e) {{}}
                         }}
                         toStr = addrs.join(", ");
                     }} catch(e) {{}}
