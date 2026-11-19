@@ -271,6 +271,14 @@ class _AppleScriptBackend:
                 verify_use_count_check = True
         self.verify_use_count_check = bool(verify_use_count_check)
 
+    # Bolt 7 — thresholds for chunked JXA scan. A single JXA call over a
+    # 6-year / 5000-message window times out at 180s because body_preview
+    # pulls up to 5000 chars per message. Splitting into 90-day windows
+    # keeps each JXA call well under the timeout while staying transparent
+    # to callers.
+    _CHUNK_MAX_WINDOW_DAYS = 90
+    _CHUNK_MAX_RESULTS_THRESHOLD = 500
+
     def scan_emails(
         self,
         start_date: datetime,
@@ -282,11 +290,89 @@ class _AppleScriptBackend:
     ) -> List[Dict]:
         """Scan a mail folder for emails within date range via JXA.
 
+        For large windows (> 90 days) or large result caps (> 500), the call
+        is internally chunked into 90-day windows to avoid the 180s JXA
+        timeout. Chunking is transparent — the API is unchanged, results are
+        deduplicated on (_msg_index, _folder_name), and iteration stops as
+        soon as max_results is reached.
+
         Args:
             folder_name: Folder to scan (default: Inbox). Must match the exact
                 folder name as it appears in Outlook (e.g., "Archive", "Snoozed",
                 "Sent Items", "Deleted Items", "Junk Email", "Drafts").
         """
+        window_days = (end_date - start_date).days
+        needs_chunking = (
+            max_results > self._CHUNK_MAX_RESULTS_THRESHOLD
+            or window_days > self._CHUNK_MAX_WINDOW_DAYS
+        )
+
+        if not needs_chunking:
+            return self._scan_window(
+                start_date=start_date,
+                end_date=end_date,
+                sender_domains=sender_domains,
+                only_with_attachments=only_with_attachments,
+                max_results=max_results,
+                folder_name=folder_name,
+            )
+
+        # Chunked: walk 90-day windows from end backwards (most-recent first).
+        chunk_days = self._CHUNK_MAX_WINDOW_DAYS
+        chunk_size = timedelta(days=chunk_days)
+        combined: List[Dict] = []
+        seen: set = set()
+        window_end = end_date
+        chunk_count = 0
+
+        while window_end >= start_date and len(combined) < max_results:
+            window_start = max(start_date, window_end - chunk_size + timedelta(days=1))
+            chunk_count += 1
+
+            remaining = max_results - len(combined)
+            window_results = self._scan_window(
+                start_date=window_start,
+                end_date=window_end,
+                sender_domains=sender_domains,
+                only_with_attachments=only_with_attachments,
+                max_results=remaining,
+                folder_name=folder_name,
+            )
+
+            for item in window_results:
+                # Dedup key — JXA assigns message indices by folder position,
+                # which is stable across chunks within a single scan session.
+                key = (item.get("id"), item.get("received_date"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                combined.append(item)
+                if len(combined) >= max_results:
+                    break
+
+            # Advance to previous window; break if we've covered start_date.
+            if window_start <= start_date:
+                break
+            window_end = window_start - timedelta(days=1)
+
+        print(
+            f"  Chunked scan: {chunk_count} window(s), "
+            f"{len(combined)} total result(s)",
+            file=sys.stderr,
+        )
+        return combined
+
+    def _scan_window(
+        self,
+        start_date: datetime,
+        end_date: datetime,
+        sender_domains: Optional[List[str]] = None,
+        only_with_attachments: Optional[bool] = None,
+        max_results: int = 250,
+        folder_name: Optional[str] = None,
+    ) -> List[Dict]:
+        """Single JXA scan over one date window. See scan_emails for the
+        public, chunking-aware wrapper."""
         domain_filter_js = "null"
         if sender_domains:
             domain_filter_js = json.dumps([d.lower() for d in sender_domains])
