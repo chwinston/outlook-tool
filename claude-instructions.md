@@ -2,6 +2,19 @@
 
 This is a general-purpose Outlook email tool. You are likely being asked to help a user search emails, download attachments, or send emails via Outlook. This file tells you everything you need to set up and use the tool.
 
+## ⚠️ SOC-Awareness for JXA / osascript probes
+
+Chris's machine (msimac) is on a monitored endpoint running Rapid7 InsightIDR via Novawatch/Coalition Security Group. **Any `osascript -l JavaScript <file>` execution — especially with a file in `/tmp/` — triggers a Medium SOC escalation.** Learned 2026-11-19 when the Bolt 7 agent wrote `/tmp/jxa_diag.js` to probe Outlook's `toRecipients()` API shape and fired alert case 19014.
+
+**Before writing or running ANY JXA diagnostic script:**
+
+1. **Warn Chris** that the next osascript call will likely trigger a SOC alert, and briefly explain what the script does
+2. **Prefer inline** `osascript -l JavaScript -e '<script>'` over writing to `/tmp/` when the script is short enough
+3. **Never** `/tmp/.hidden` or obfuscated names — they look more suspicious, not less
+4. **Record a brief rationale** in the commit message so the audit trail is self-explanatory if Chris Griffith asks later
+
+Normal `OutlookClient` operations (`.search`, `.move`, `.delete`, etc.) route through the project's `_run_jxa` helper and are expected traffic — no warning needed for those.
+
 ## Architecture
 
 ```
